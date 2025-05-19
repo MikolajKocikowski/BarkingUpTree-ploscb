@@ -1,6 +1,6 @@
 # RNA-seq Analysis Code for Immune Checkpoint Study in Humans and Dogs
 
-This repository contains R code associated with the publication: **"Barking Up the Right Tree: Immune Checkpoint Signatures of Human and Dog Cancers"**, preprint DOI: [https://doi.org/10.1101/2024.06.26.600825](https://doi.org/10.1101/2024.06.26.600825). Currently in review at *PLOS Computational Biology*.
+This repository contains R code associated with the publication: **"Barking Up the Right Tree: Immune Checkpoint Signatures of Human and Dog Cancers"**, preprint DOI: [10.1101/2024.06.26.600825](https://doi.org/10.1101/2024.06.26.600825). Currently in review at *PLOS Computational Biology*.
 
 ## Overview
 
