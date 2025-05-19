@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this code or data, please cite the following preprint:"
+title: "Barking Up the Right Tree: Immune Checkpoint Signatures of Human and Dog Cancers"
+authors:
+  - family-names: Kocikowski
+    given-names: Mikolaj
+    orcid: 0000-0001-7396-9005
+  - family-names: Yébenes Mayordomo
+    given-names: Marcos
+  - family-names: Alfaro
+    given-names: Javier
+  - family-names: Parys
+    given-names: Maciej
+date-released: 2024-06-26
+doi: 10.1101/2024.06.26.600825
+url: https://www.biorxiv.org/content/early/2024/06/29/2024.06.26.600825
+repository-url: https://github.com/MikolajKocikowski/BarkingUpTree-ploscb
