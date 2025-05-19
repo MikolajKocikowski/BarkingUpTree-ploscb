@@ -1,0 +1,4005 @@
+---
+title: "RNA-seq analysis from Kallisto output: tximport + DESeq2"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load required packages for RNA-seq analysis (starting from Kallisto quantification)
+
+# Core analysis
+library(DESeq2)
+library(tximport)
+library(tximportData)
+library(GenomicFeatures)
+library(PCAtools)
+library(matrixStats)
+library(ensembldb)
+
+# Plotting and tidy tools
+library(tidyverse)        # includes ggplot2, dplyr, readr, tidyr, magrittr.
+library(pheatmap)
+library(RColorBrewer)
+library(wesanderson)
+library(ggrepel)
+library(viridis)
+library(corrplot)
+library(ggalt)
+
+# Clustering and dimensionality reduction
+library(umap)
+library(Rtsne)
+library(dendextend)
+library(factoextra)
+library(amap)
+
+# Misc
+library(knitr)
+library(stringi)
+```
+
+```{r}
+# Creating tx2gene table of transcripts and corresponding genes from GTF to summarize the quantified reads on a gene level
+# Required: library(GenomicFeatures)
+
+gffFile <- "./INPUT/Canis_lupus_familiarisboxer.Dog10K_Boxer_Tasha.107.gtf"
+
+txdb <- makeTxDbFromGFF(file=gffFile,
+                        dataSource="canine gtf from Ensembl FTP",
+                        organism="Canis familiaris")
+
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- AnnotationDbi::select(txdb, k, "GENEID", "TXNAME")
+
+# check
+head(tx2gene)
+```
+
+
+```{r}
+# IMPORTING COUNT DATA FROM MULTIPLE SUBFOLDERS
+# Requires: library(tximport)
+
+# Set the working directory if needed
+dir <- "./INPUT/Kallisto"
+
+# make a list of all results sub-folders with paths
+directories <- list.files(dir, full.names = TRUE)
+
+# make a list of all files (with paths) that match .tsv extension - avoids leftover .txt files etc.
+files <- list.files(directories, pattern = ".tsv", full.names = TRUE)
+
+# make a list of file names to be used as sample names, but keeping paths because otherwise they are alphabetically sorted according to the filename without path and do not match the order of "files" vector
+names_raw <- tools::file_path_sans_ext(list.files(directories, full.names = TRUE))
+
+# Now that the names vector has correct order of file=sample names, we remove the path string
+names_processed <- str_remove_all(names_raw, "./INPUT/Kallisto/Kallisto_Results_[a-zA-Z]*[_]{1}[a-zA-Z0-9]*[/]")
+names(files) <- names_processed
+
+# check
+head(files)
+
+# Check: will be FALSE if the path is longer than ~255 characters - need to shorten the file names.
+all(file.exists(files))
+
+# Summarizing results at gene level with tximport
+# The IgnoreTxVersion argument is important - matches tx IDs even if some have a dot and version like TRANS12345.3 which is the case in this data
+txi <- tximport(files, type = "kallisto", tx2gene = tx2gene, ignoreTxVersion = TRUE)
+
+# check
+names(txi)
+```
+
+```{r}
+# Importing txi results to DESeq2
+
+# creating a factor (vector type) necessary for DESeq2 with condition types
+# I input TCL twice, for clarity, as there are two studies but it's one type for analysis - same for hemangiosarcoma
+
+condition = factor(c(rep("ameloblastoma", 11), rep("B-cell lymphoma", 12), rep("mammary cancers", 158), rep("glioma", 42), rep("hemangiosarcoma", 45), rep("hemangiosarcoma", 8), rep("insulinoma", 6), rep("melanoma", 12), rep("meningioma", 13), rep("osteosarcoma", 61), rep("oral squamous cell carcinoma", 10), rep("prostate carcinoma", 11), rep("lung carcinoma", 12), rep("T-cell lymphoma", 12), rep("T-cell lymphoma", 6), rep("urothelial carcinoma", 145)))
+
+# Preparing a vector for reordering x axis on ggplots
+
+condition_order <- c("B-cell lymphoma", "T-cell lymphoma", "glioma", "hemangiosarcoma", "mammary cancers", "melanoma", "osteosarcoma", "lung carcinoma", "urothelial carcinoma", "ameloblastoma", "insulinoma", "meningioma", "oral squamous cell carcinoma", "prostate carcinoma")
+
+# Preparing the corresponding x axis labels to include sample numbers.
+
+newxlabels <- c("B-cell lymphoma (n=12)", "T-cell lymphoma (n=18)", "glioma (n=42)", "hemangiosarcoma (n=53)", "mammary cancers (n=158)", "melanoma (n=12)", "osteosarcoma (n=31)", "lung carcinoma (n=12)", "urothelial carcinoma (n=29)", "ameloblastoma (n=11)", "insulinoma (n=6)", "meningioma (n=13)", "oral squamous cell carcinoma (n=10)", "prostate carcinoma (n=11)")
+
+# checking if the number is right - needs to be the same as the number of "files"
+length(condition) == length(files)
+
+# manual check - are the cancer names matching file order
+test <- cbind(names(files), as.vector(condition))
+
+#Constructing a dds object for DESeq2
+
+sampleTable <- data.frame(condition)
+rownames(sampleTable) <- colnames(txi$counts)
+dds <- DESeqDataSetFromTximport(txi, sampleTable, ~condition)
+```
+
+```{r}
+# Collapsing replicates - multiple runs of the same sample into one sample.
+
+# UC: 29 samples with 5 runs each, IDs in order
+
+# OS: Each sample was run twice, EXCEPT SRX2213196 which has only one run - SRR4346354. Hence 31 samples and 61 files. It's 32 runs in pairs (16 spl numbers), then the SRR4346354, then 28 other runs in pairs (14 spl numbers)
+
+#I first export all the files, to manually control the numbers
+write.csv(names(files),file="./OUTPUT/input_file_list.csv",row.names=F)
+
+# Preparing vectors for the studies with replicates
+
+os1 <- rep(308:323,each=2)
+os2 <- rep(325:338,each=2)
+OS <- c(os1, 324, os2)
+
+#control
+length(OS)
+
+UC <- rep(390:418,each=5)
+
+#control
+length(UC)
+
+#Preparing a factor describing which runs belong to separate samples
+
+sample_reps = factor(c(1:307, OS, 339:389, UC))
+
+# MAanual check
+
+test <- cbind(names(files), as.vector(sample_reps))
+
+# Actual collapsing
+# rdocumentation.org/packages/DESeq/versions/1.24.0/topics/collapseReplicates
+
+dds$replicates <- sample_reps
+
+ddsColl <- collapseReplicates(dds, dds$replicates)
+
+#Check the sizes before and after collapsing "replicates"
+
+dim(dds)
+dim(ddsColl)
+```
+
+
+```{r}
+# Identify samples with zero total counts (likely failed quantification), which would prevent DESeq2 from working. 
+# One reason can be a k-mer size in Kallisto index larger than read size in some samples, like in 15 out of 23 HSA samples
+
+zero_samples <- colSums(counts(ddsColl)) == 0
+dds_failed <- ddsColl[,zero_samples]
+colnames(dds_failed)  # List bad samples
+```
+
+```{r}
+# Identify genes (rows) with zero counts across all samples
+# Here, these all were "novel genes" with little info, mostly protein-coding, not relevant to this analysis.
+
+zero_genes <- rowSums(counts(ddsColl)) == 0
+dds_zero_genes <- ddsColl[zero_genes,]
+rownames(dds_zero_genes)  # List genes with no expression
+```
+
+
+```{r}
+# DESeq2 preparation
+
+# Filtering: by removing rows with very few reads, we reduce the memory size of the dds object, and speed up DESeq2. 
+# Minimal pre-filtering to keep only rows that have any reads in total is "> 0". For the record > 15 removes 1433 rows out of 20k+.
+
+# size before filtering
+dim(ddsColl)
+
+#filtering
+keep_genes <- rowSums(counts(ddsColl)) > 0
+dds_filtered <- ddsColl[keep_genes,]
+
+# size after filtering
+dim(dds_filtered)
+```
+
+
+```{r}
+# DESeq2
+
+# Normally, DESeq2 normalizes for differences in library sizes/composition, which enables inter-sample comparison. But not intra-sample comparison between genes, because they have different transcript lengths which affects the count number. So normally we would need to prepare a non-DESeq2-based figure to precisely compare expression of different ICs within a specific cancer type. However, thanks to tximport, DESeq2 imports also transcripts lengths and normalizes data for this too, so I an use the output to compare both genes and cancer types: https://support.bioconductor.org/p/9135244/, https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+
+dds_processed <- DESeq(dds_filtered)
+
+# Save the DESeq2 output dataset to .Rdata
+save(dds_processed, file = "./OUTPUT/BarkingUpTree_DDS_processed.RData")
+
+#show size after transformation
+dim(dds_processed)
+```
+
+```{r}
+# checking DESeq2 results 
+
+res <- results(dds_processed)
+res
+```
+
+```{r}
+# Investigating DESeq2 warnings: non-converged genes
+
+# DESeq2 may report convergence issues in a number of genes, stemming from low counts, few samples, and outliers affecting model fitting
+# I'm not removing these genes prior to DESeq2 — if they're low-expressed, that itself is biologically relevant.
+
+# Get IDs of non-converged genes
+nonconverged <- !mcols(dds_processed)$betaConv
+dds_nonconv <- dds_processed[nonconverged, ]
+write.csv(rownames(dds_nonconv), "./OUTPUT/BetaConv_False_badgenes.csv")
+
+# Export raw tximport matrices for manual inspection
+write.csv(txi$counts, "./OUTPUT/TXI_beforeDESeq2_counts.csv")
+write.csv(txi$abundance, "./OUTPUT/TXI_beforeDESeq2_abundance.csv")
+write.csv(txi$length, "./OUTPUT/TXI_beforeDESeq2_length.csv")
+write.csv(txi$countsFromAbundance, "./OUTPUT/TXI_beforeDESeq2_countsFromAbundance.csv")
+
+```
+
+```{r}
+# Assessing results — specific to pipelines using tximport
+
+# Worked in 2022 - see https://support.bioconductor.org/p/117781/
+# plot((colSums(normalizationFactors(dds_processed))), colSums(counts(dds_processed)),
+#     ylab = "library sizes", xlab = "normalization factors", cex = .6 )
+
+# Works in 2025
+plot(sizeFactors(dds_processed), colSums(counts(dds_processed)),
+     xlab = "size factors", ylab = "library sizes", cex = 0.6)
+```
+
+```{r}
+# Here we log-transform the read counts to see the influence of normalization (in this case, for sequencing depth and transcript length).
+# Log, because we couldn't see the difference on a linear plot due to range of the read counts covering several orders of magnitude. 
+# Compare the two plots below.
+
+## plot of non-normalized values
+png("./OUTPUT/Log Non-normalized read counts.png", width = 10000, height = 1000)
+
+par(mai=c(5, 1, 1, 1)) # enlarge marigins to fit labels, mai - in inches, order: bottom, left, upper, right
+boxplot(log2(counts(dds_processed)+1), cex.axis=1, notch=T, las=2, 
+        main = "Non-normalized read counts",
+        ylab="log2(read counts)", cex = .6)
+dev.off()
+
+## plot of size-factor normalized values
+png("./OUTPUT/Log Normalized read counts.png", width = 10000, height = 1000)
+
+par(mai=c(5, 1, 1, 1))
+boxplot(log2(counts(dds_processed, normalize= TRUE) +1), notch=T, las=2,
+        main = "Normalized read counts",
+        ylab="log2(read counts)", cex = .6)
+dev.off()
+```
+
+```{r}
+# Optional QC: scatterplots of log2 read counts between two samples
+# Based on: https://physiology.med.cornell.edu/faculty/skrabanek/lab/angsd/lecture_notes/08_practical.pdf
+
+## Raw (non-normalized) read counts (plus pseudo-count)
+
+png("./OUTPUT/Sample correlation - non-normalized log read counts.png", width = 2000, height = 1000)
+
+log.counts <- log2(counts(dds_processed, normalized = FALSE) + 1)
+assay(dds_processed, "log.counts") <- log.counts
+dds_processed[, c(colnames(dds_processed)[101], colnames(dds_processed)[102])] %>%
+  assay(., "log.counts") %>%
+  plot(., cex=.1, main = "non-normalized read counts")
+
+dev.off()
+
+## normalized read counts (plus pseudo-count)
+
+png("./OUTPUT/Sample correlation - normalized log read counts.png", width = 2000, height = 1000)
+
+log.counts <- log2(counts(dds_processed, normalized = TRUE) + 1)
+assay(dds_processed, "log.counts") <- log.counts
+dds_processed[, c(colnames(dds_processed)[101], colnames(dds_processed)[102])] %>%
+  assay(., "log.counts") %>%
+  plot(., cex=.1, main = "normalized read counts")
+
+dev.off()
+
+```
+
+
+```{r}
+# PCA plot for QC - highlights sample-level variation (e.g., batch, sex, prep method) - not resulting from the difference between experimental groups.
+# This could then be normalized and important especially for differential expression.
+
+# Use vst-transformed data for visualization
+rld <- vst(dds_processed, blind = TRUE)
+
+# Uncomment to save plot to file
+# png("OUTPUT/PCA_Plot_by_Condition.png", 500, 500)
+
+plotPCA(rld, intgroup = "condition")
+
+# dev.off()
+```
+
+
+```{r}
+# Hierarchical Clustering; pheatmap function requires a dataframe of numeric values as input that can be retrieved from the rld object
+# assay() is function from DESeq2; Samples below 0.80 may indicate an outlier in your data and/or sample contamination.
+
+rld_mat <- assay(rld)    
+
+# Compute pairwise correlation values
+rld_cor <- cor(rld_mat)
+
+# Plot the correlation values as a heatmap:
+# The legend is tiny, in upper right corner
+
+png("./OUTPUT/Hierarchical Clustering of log normalized counts.png",  width = 10000, height = 10000)
+pheatmap(rld_cor)
+dev.off()
+
+# We don't have real sample replicates here, where we could reject some based on the pheatmap.
+# However, OSCC samples clearly - especially 4 of them - are "low" (blue), which makes sense since they are from FFPE
+```
+
+```{r}
+# Obtaining normalized counts as a new table
+
+# Save the condition names, easy to lose to sorting by replicate identifiers which are colnames now by default
+colnames(dds_processed)<-dds_processed$condition
+
+# obtain the data
+mycounts <- counts(dds_processed, normalized=TRUE)
+
+#Sort the columns alphabetically by condition in the column name for clarity
+mycounts <- mycounts[,order(colnames(mycounts))]
+
+```
+
+
+```{r}
+# Preparing the IC expression plot
+
+#Selecting genes of interest.
+
+selected2 <- c("ENSCAFG00000013184", "ENSCAFG00000002120", "ENSCAFG00000002121", "ENSCAFG00000023455", "ENSCAFG00000018641","ENSCAFG00000014675", "ENSCAFG00000032313", "ENSCAFG00000012876", "ENSCAFG00000012872", "ENSCAFG00000010997", "ENSCAFG00000011751", "ENSCAFG00000010817", "ENSCAFG00000012722", "ENSCAFG00000004666", "ENSCAFG00000025524", "ENSCAFG00000009887", "ENSCAFG00000014498", "ENSCAFG00000014354", "ENSCAFG00000009858", "ENSCAFG00000013828", "ENSCAFG00000013933", "ENSCAFG00000012880", "ENSCAFG00000010718", "ENSCAFG00000019328", "ENSCAFG00000057149", "ENSCAFG00000019673", "ENSCAFG00000030400", "ENSCAFG00000009994", "ENSCAFG00000018945", "ENSCAFG00000015149", "ENSCAFG00000030308", "ENSCAFG00000000038", "ENSCAFG00000019329", "ENSCAFG00000014590", "ENSCAFG00000019422", "ENSCAFG00000018627", "ENSCAFG00000055618", "ENSCAFG00000010480", "ENSCAFG00000028587", "ENSCAFG00000017820", "ENSCAFG00000010358", "ENSCAFG00000012598", "ENSCAFG00000000386", "ENSCAFG00000005750")
+
+#protein names for gene IDs
+
+names2 <- c("PD-1", "PD-L1", "PD-L2", "TIM-3", "GAL-9", "LAG-3", "FGL-1", "CTLA-4", "CD28", "CD80", "CD86", "TIGIT", "NECTIN4", "CD155", "SIRPA", "CD47", "PVRIG", "VISTA", "B7-H4", "A2AR", "NOX2", "ICOS", "ICOSLG", "OX40", "OX40L", "4-1BB", "4-1BBL", "CD40", "CD40L", "CD27", "CD70", "CD226", "GITR", "GITRL", "HVEM", "LIGHT", "CD160", "BTLA", "NKG2A", "B7-H3", "TACTILE", "SLAMF7", "Arginase 1", "IDO")
+
+length(selected2)==length(names2)
+
+mycounts_selected2 <- mycounts[selected2,]
+
+mycountsxxx2 <- as.data.frame(mycounts_selected2)
+
+condition2 <- colnames(mycountsxxx2)
+
+#Adding the first row with condition names; condition is a factor, so needs to be changed into a vector so I can keep the words in names
+
+extra_row_2 <- as.character(condition2)
+
+extra_row2_2 <- as.data.frame(extra_row_2)
+
+extra_row3_2 <- transpose(extra_row2_2)
+
+mycounts2_2 <- rbind(extra_row3_2, mycountsxxx2)
+
+rownames(mycounts2_2)[1] <- "condition"
+
+mycounts3_2 <- t(mycounts2_2)
+
+mycounts4_2 <- as.data.frame(mycounts3_2)
+
+# It was hard to run aggregate - lots of errors - a data frame can contain columns that are... lists. 
+# So this is how to convert them to vectors; check with typeof(mycounts5$condition)
+
+mycounts5_2 <- data.frame(lapply(mycounts4_2, function(x) unlist(x)))
+
+# Aggregate all count data by condition column, the function applied is mean, and [,-1] removes the "condition" (first) column from the aggregation outcome as it would contain NAs and cause a warning. 
+
+mycounts6_2 <- aggregate(mycounts5_2[,-1], by=list(Condition=mycounts5_2$condition), FUN=mean)
+
+write.csv(mycounts6_2, file = "./OUTPUT/Sup_table_Normalized_Counts_Sum_mycounts6_2.csv")
+
+mean <- mycounts6_2
+
+# getting standard deviation table analogous to the results table
+
+deviation <- aggregate(mycounts5_2[,-1], by=list(Condition=mycounts5_2$condition), FUN=sd)
+
+write.csv(deviation, file = "./OUTPUT/Sup_table_Normalized_Counts_deviation_deviation.csv")
+
+# Median
+
+median <- aggregate(mycounts5_2[,-1], by=list(Condition=mycounts5_2$condition), FUN=median)
+
+write.csv(median, file = "./OUTPUT/Sup_table_Normalized_Counts_median_median.csv")
+
+
+# When I named the df "mad", after some time, an entry named "mad" appeared on the Environment/Functions list, and it clearly confuses R, leading tounsolveable error when running aggregate with FUN=mad. Hence, rename the "maddd", as mad is a name of a function.
+
+maddd <- aggregate(mycounts5_2[,-1], by=list(Condition=mycounts5_2$condition), FUN=mad)
+
+write.csv(maddd, file = "./OUTPUT/Sup_table_Normalized_Counts_mad_mad.csv")
+
+#20230112 New MADm, as it used to be calculated later, on a long table versions already, there might be things to correct 
+
+MADm <- cbind(maddd[,1], maddd[,-1]/median[,-1] * 100)
+colnames(MADm)[1] <- "Condition"
+
+write.csv(MADm, file = "./OUTPUT/Sup_table_Normalized_Counts_MADm_MADm.csv")
+
+#Converting data to long format, preferred for GGplot
+#Notice the range of columns specific to the names in this experiment
+
+mycounts_long2 <- gather(mycounts6_2, Gene, Count, ENSCAFG00000013184:ENSCAFG00000005750, factor_key=TRUE)
+
+deviation_long <- gather(deviation, Gene, stdev, ENSCAFG00000013184:ENSCAFG00000005750, factor_key=TRUE)
+
+median_long <- gather(median, Gene, median, ENSCAFG00000013184:ENSCAFG00000005750, factor_key=TRUE)
+
+mad_long <- gather(maddd, Gene, MAD, ENSCAFG00000013184:ENSCAFG00000005750, factor_key=TRUE)
+
+MADm_long <- gather(MADm, Gene, MADm, ENSCAFG00000013184:ENSCAFG00000005750, factor_key=TRUE)
+
+```
+
+
+```{r}
+# THIS IS A FUNCTION TO GENERATE AND SAVE HEATMAP PLOTS WITH LESS CODE REPETITION
+
+#To make a linear, not log plot, declare "identity" as a transformation, it equals "do nothing".
+#Warning: R will not return warnings that happen when the function runs.
+
+gg_function_3 <- function(dataset, fill, x, y, title, viridis_option, legend_name, transformation, breaks, labels) {
+  ggplot(data = dataset, aes(x = forcats::fct_relevel(Condition, condition_order), y=factor(Gene,levels = rev(levels(factor(Gene)))), fill= fill)) + 
+    geom_tile(color = "white") + 
+    coord_equal() +
+    scale_x_discrete(labels= newxlabels, guide = guide_axis(angle = 90)) +
+    scale_y_discrete(labels = rev(names2)) +
+    labs(x=x, y=y)  + 
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(family = "sans", face = "bold", size = 12)) +
+    scale_fill_gradientn(colours = viridis(256, option = viridis_option), name = legend_name, trans = transformation, breaks = breaks, labels = labels)
+  
+  ggsave(
+    paste("./OUTPUT/Heatmap - ", title, ".png", sep = ""),
+    plot = last_plot(),
+    device = "png",
+    path = "./",
+    scale = 1,
+    width = 30,
+    height = 30,
+    units = "cm",
+    dpi = "print",
+    limitsize = TRUE,
+    bg = NULL,
+  ) 
+
+}
+```
+
+
+```{r}
+# IC ABUNDANCE MEAN NORMALIZED TO EACH GENE ORDER OF MAGNITUDE
+
+mean_means_vector <- colMeans(as.matrix(mean[,c(-1)]))
+
+# Because R cannot divide a df ROWS by a vector (or by a medians column I was adding previously)
+mean_t <- t(mean[,-1])
+colnames(mean_t) <- mean[,1]
+
+#Normalization step
+mean_t_n <- mean_t/mean_means_vector
+
+mean_t_n_t <- t(mean_t_n)
+
+mean_t_n_t <- cbind(Condition=rownames(mean_t_n_t), mean_t_n_t)
+
+##Saving the table
+write.csv(mean_t_n,file="./OUTPUT/mean_t_n_export.csv",row.names=T)
+
+#GG Prep
+
+mean_t_n_t <- as.data.frame(mean_t_n_t)
+
+mean_t_n_t_long <- gather(mean_t_n_t, Gene, mean, ENSCAFG00000013184:ENSCAFG00000005750, factor_key=TRUE)
+
+mean_t_n_t_long$mean <- as.numeric(mean_t_n_t_long$mean)
+
+#Plot
+
+gg_function_3(mean_t_n_t_long, mean_t_n_t_long$mean, "Cancer type", "Immune checkpoints", "IC abundance score - Log10", "viridis", "Abundance score", "log10", waiver(), waiver())
+
+```
+
+
+```{r}
+# GGPLOTS
+
+# defining legend marked levels - and labels for them - to match log
+
+my_breaks = c(1, 10, 100, 1000, 10000, 100000)
+my_breaks_labels =c(0, 1, 2, 3, 4, 5)
+
+# THIS IS A RESULTS (MEAN) PLOT - LOG10
+
+gg_function_3(mycounts_long2, mycounts_long2$Count +1, "Cancer type", "Immune checkpoints", "Mean IC expression - Log10", "viridis", "DESeq2-normalized counts (log10)", "log10", my_breaks, my_breaks_labels)
+
+#T HIS IS A RESULTS (MEAN) PLOT - linear
+
+gg_function_3(mycounts_long2, mycounts_long2$Count, "Cancer type", "Immune checkpoints", "Mean IC expression - Linear", "viridis", "DESeq2-normalized counts (linear)", "identity", waiver(), waiver())
+
+# THIS IS A STANDARD DEVIATION PLOT
+
+gg_function_3(deviation_long, deviation_long$stdev, "Cancer type", "Immune checkpoints", "Mean IC expression - standard deviation", "rocket", "Standard deviation (log10)", "log10", my_breaks, my_breaks_labels)
+
+# THIS IA A %CV PLOT
+# Because it is more telling: stdev will be higher if values are higher
+
+cv_test <- deviation_long
+cv_test$stdev <- deviation_long$stdev / mycounts_long2$Count * 100  
+names(cv_test)[3] <- "CV"
+
+gg_function_3(cv_test, cv_test$CV, "Cancer type", "Immune checkpoints", "Mean IC expression - CV - Linear", "rocket", "Coefficient of variation (%CV)", "identity", waiver(), waiver())
+
+#THIS IS A MEDIAN PLOT - log10
+
+gg_function_3(median_long, median_long$median, "Cancer type", "Immune checkpoints", "Median IC expression - Log10", "viridis", "median (log10)", "log10", my_breaks, my_breaks_labels)
+
+# THIS IS AN IMPROVED MEDIAN PLOT - log10
+# If there are mainly 0 count values in a sample group, the median is 0. Zero, when logged, results in infinity (again), so since we have gene/cancer sets with mainly zeros, these are displayed as grey spots on the heatmap. And a more telling value here is 0. 0 has a specific colour on a legend. So for these to be displayed appropriately, and not like a lack of data (grey), I add pseudocount to the argument for log10, and describe the legend appropriately.
+
+gg_function_3(median_long, median_long$median + 1, "Cancer type", "Immune checkpoints", "Median IC expression - log10(Count + 1)", "viridis", "median - log10(count + 1)", "log10", my_breaks, my_breaks_labels)
+
+#THIS IS A MEDIAN PLOT - linear
+
+gg_function_3(median_long, median_long$median, "Cancer type", "Immune checkpoints", "Median IC expression - Linear", "viridis", "median - linear", "identity", waiver(), waiver())
+
+#THIS IS A MAD PLOT - linear
+
+gg_function_3(mad_long, mad_long$MAD, "Cancer type", "Immune checkpoints", "MAD - Linear", "rocket", "MAD - linear", "identity", waiver(), waiver())
+
+#THIS IS A MAD PLOT - log10
+# Applying pseudocount again to display near-0 values appropriately instead of grey squares after the log10 transformation.
+
+gg_function_3(mad_long, mad_long$MAD + 1, "Cancer type", "Immune checkpoints", "MAD - log10(Count + 1)", "rocket", "MAD - log10(Count + 1)", "log10", my_breaks, my_breaks_labels)
+
+#A PLOT FOR MADm - MAD/MEDIAN (%) - LINEAR
+# It is an equivalent of SD=>CV for MAD - accounts for different orders of magnitude between genes, just like CV makes them comparable, unlike SD.
+# https://arxiv.org/abs/1907.01110 according to this paper its fine and even very robust, including non-normal distribution. For me the most important is that it gives understandable information on variance. The issue with normal MAD was the same as with STDEV - the higher expression, the higher value for these QC stats, so the variablity plot mimics the results plot (heatmap), and in case of MAD they looked almost identical.
+
+#There are grey spots on MAD/m heatmap, because if the median is 0, MADm would require dividing by 0, so these are NA values. Happens in sample groups without significant expression, but an exception could be if there is a cluster of a few spls with high expression, and a bigger one with zeros, so there is still an important subset with expression, but median is 0 and MADm cannot be calculated.
+
+gg_function_3(MADm_long, MADm_long$MADm, "Cancer type", "Immune checkpoints", "MADm - Linear", "rocket", "MADm - linear", "identity", waiver(), waiver())
+
+#It is fundamental to remember here, that variance here is based on different expression levels detected in biological samples which are nor really replicates, but come from different patients, so while it could be a result of bad experimental quality, it is likely to be due to individual, biological differences. It may mean there is a subset of patients that are low, and another - high - in something, and only some of them make good candidates for specific treatment, for instance.
+
+# Another option to display results of the heatmap would be Geometric Mean. Disadvantages: "If any one of the observations is zero the geometric mean becomes zero no matter how large the other values may be".
+```
+
+
+```{r}
+# CONTROL PLOTS TO ASSESS DATAPOINT DISTRIBUTION
+
+# For datapoint distribution I need not the summarized result table with the mean, but the table before with separate samples, in the long format
+
+mycounts_long3 <- gather(mycounts5_2, Gene, Count, ENSCAFG00000013184:ENSCAFG00000005750, factor_key=TRUE)
+write.csv(mycounts5_2, file = "./OUTPUT/Sup_table_Normalized_Counts_datapoint-distribution_mycounts5_2.csv")
+
+# Prep for making facets in all following plots
+
+genelist2 <- selected2
+gene.labs <- names2
+names(gene.labs) <- genelist2
+
+# I must use "y=log10(Count + 1)" instead of "y=Count" and "+ scale_y_log10()", because this intuitive option leads to R disaster. If a group of values for cancer/gene combination has zeros, after log they are infinite, and are rejected. We get a warning "Transformation introduced infinite values in continuous y-axis" and many tutorials ignore it. Another warning: "Removed 771 rows containing non-finite values (stat_ydensity)/(stat_boxplot)/(stat_summary)". This was the number of rows in the df that had a 0 value in counts. It seems fair, but... for some conditions there is no samples left, so we get a warning "Groups with fewer than two data points have been dropped.". In other cases, it might be 9 zeros and one value of 206. The zeros are removed not just from plot visualization, but also from calculating stats for the plot. So if I add a mark for mean, or a boxplot, they will show the mean as 206, while it should be 20,6. We need to add pseudocount of 1 while making the input data log already in aes - and then describe the axis with (log10), because otherwise we lose the information what are the real values.
+
+# BOXPLOT - LOG10
+
+#The horizontal line in boxplots is median, not mean!
+#I did check, and this mean is calculated before any log operations, so it is not false, like with the values of stat_summary on plots that use log transformation without using coord_trans (the next ones). So no need to overcomplicate the plot. Can stay as it was.
+
+#jitter - adds a bit of randomness but makes it more readable: geom_jitter(height = 0); because without "0" height it will also add randomness vertically which we don't want.
+#outlier.shape = NA - delete it to have outliers automatically marked as a big black dot
+
+ggplot(mycounts_long3, aes(x = forcats::fct_relevel(condition, condition_order), y=log10(Count + 1))) +
+  geom_boxplot(outlier.shape = NA, fill="#009E73", ) +
+  facet_wrap(. ~ Gene, ncol=1, scales = "free", labeller = labeller(Gene = gene.labs)) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  geom_point(alpha=0.2, size=3) +
+  theme(strip.text.y = element_text(size=12, angle=0)) + theme(legend.position = "none") +
+  labs(x="cancer study", y="Counts normalized by DESeq2 - log10(Counts +1)") + 
+  ggtitle("Canine pan-cancer immune checkpoints expression - log10") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(
+  "./OUTPUT/Datapoints distribution boxplot - log10.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 210, 
+  height = 4000, 
+  units = "mm",  
+  dpi = "print",
+  limitsize = FALSE,
+  bg = "white",
+)
+
+#VIOLIN PLOT
+
+# Unfortunately violin plot also has to be modified so that the mean is displayed correctly. BUT this makes most violins much thinner. And geom_violin(width = ...) option makes only a bigger mess. So we can have not very useful violins with mean, or nicer violins, without mean. I thought to overwrite it with invisible boxplots on top with visible median, but you can't control median line parameters in ggplot geom_boxplot (like you could in an independent, simple boxplot)
+
+# Simple violin chart without stats
+
+ggplot(mycounts_long3, aes(x = forcats::fct_relevel(condition, condition_order), y=log10(Count + 1))) + 
+  geom_violin() + 
+  facet_wrap(. ~ Gene, ncol=1, scales = "free", labeller = labeller(Gene = gene.labs)) + 
+  theme(strip.text.y = element_text(size=12, angle=0)) + 
+  theme(legend.position = "none") + 
+  labs(x="cancer study", y="Counts normalized by DESeq2 - log10(Counts +1)") + 
+  ggtitle("Canine pan-cancer immune checkpoints expression - log10") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), panel.grid.minor = element_blank())
+
+ggsave(
+  "./OUTPUT/Violin plots - no stats - log10.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 210, 
+  height = 4000, 
+  units = "mm",  
+  dpi = "print",
+  limitsize = FALSE,
+  bg = "white",
+)
+
+# Modified violin chart with correct mean as a stat, but violins are thin
+
+ggplot(mycounts_long3, aes(x = forcats::fct_relevel(condition, condition_order), y=Count + 1)) + 
+  geom_violin() + 
+  facet_wrap(. ~ Gene, ncol=1, scales = "free", labeller = labeller(Gene = gene.labs)) + 
+  theme(strip.text.y = element_text(size=12, angle=0)) + 
+  theme(legend.position = "none") + 
+  labs(x="cancer study", y="Counts normalized by DESeq2 - log10(Counts +1)") + 
+  stat_summary(fun = "mean", geom = "point", shape = 3, size = 2, color = "black") + 
+  ggtitle("Canine pan-cancer immune checkpoints expression - log10") + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  coord_trans(y="log10") +
+  scale_y_continuous(breaks = my_breaks, labels = my_breaks_labels) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), panel.grid.minor = element_blank())
+
+ggsave(
+  "./OUTPUT/Violin plot - with mean - log10.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 210, 
+  height = 4000, 
+  units = "mm",  
+  dpi = "print",
+  limitsize = FALSE,
+  bg = "white",
+)
+
+
+# COMPRESSED DOTPLOT - LOG10
+
+#Compressing the plot so that its a managable figure, on one page.
+
+ggplot(mycounts_long3, aes(x = forcats::fct_relevel(condition, condition_order), y= Count + 1)) +
+  facet_wrap(. ~ Gene, ncol=4, scales = "free_y", labeller = labeller(Gene = gene.labs)) +
+  geom_point(alpha=0.2, size=1) +
+  theme(strip.text.y = element_text(size=12, angle=0)) + 
+  theme(legend.position = "none") +
+  labs(x="cancer study", y="Counts normalized by DESeq2 - log10(Counts +1)") + 
+  ggtitle("Canine pan-cancer immune checkpoints expression") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  stat_summary(fun = "mean", geom = "point", shape=3, size = 2, color = "black") +
+  stat_summary(fun = "median", geom = "point", shape=4, size = 2, color = "black") +
+  coord_trans(y="log10") +
+  scale_y_continuous(breaks = my_breaks, labels = my_breaks_labels) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.25), panel.grid.minor = element_blank())
+
+ggsave(
+  "./OUTPUT/Compressed dotplot of datapoints distribution - log10.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 210, 
+  height = 297, 
+  units = "mm",  
+  dpi = "print",
+  limitsize = FALSE,
+  bg = "white",
+)
+
+```
+
+
+```{r}
+#Displaying the most expressed ICs among all cancers and cancers expressing the most ICs
+
+winners <- mycounts6_2
+
+#Making sure the colnames are the same as in the gene list
+colnames(winners[,-1]) == selected2
+#...So that I can rename them to human readable
+name_prep <- c("Condition", names2)
+colnames(winners) <- name_prep
+
+#exporting mean-summarized results with humane names
+
+write.csv(winners, file='./OUTPUT/Summarised_expression_canine_ICs - mean.csv', row.names=FALSE)
+
+candidate_cancers <- winners[,1]
+sum_cancers <- rowSums(winners[,-1])
+table_cancers <- data.frame(candidate_cancers, sum_cancers) 
+
+ggplot(table_cancers, aes(x=reorder(candidate_cancers, -sum_cancers), y=sum_cancers/44)) + 
+  geom_bar(stat="identity", fill="#009E73") +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  labs(x="Cancer type", y="Total normalized counts per 1 gene", title="Total IC expression by cancer type - mean based") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(
+  "./OUTPUT/Total IC expression by cancer type - mean based.png",
+  plot = last_plot(),
+  dpi = "print",
+  bg = "white",
+)
+
+candidate_genes <- colnames(winners[,-1])
+sum_genes <- colSums(winners[,-1])
+table_genes <- data.frame(candidate_genes, sum_genes) 
+
+ggplot(table_genes, aes(x=reorder(candidate_genes, -sum_genes), y=sum_genes/14)) + 
+  geom_bar(stat="identity", fill="#009E73") +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  labs(x="Gene", y="Total normalized counts per 1 cancer type", title="Total IC expression by gene  - mean based") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(
+  "./OUTPUT/Total IC expression by gene- mean based.png",
+  plot = last_plot(),
+  dpi = "print",
+  bg = "white",
+)
+
+```
+
+
+```{r}
+#most expressed ICs among per IC and per cancer - MEDIAN BASED NOW
+
+winners <- median
+
+#Making sure the colnames are the same as in the gene list
+colnames(winners[,-1]) == selected2
+#...So that I can rename them to human readable
+name_prep <- c("Condition", names2)
+colnames(winners) <- name_prep
+
+#exporting median-summarized results with human names
+
+write.csv(winners, file='./OUTPUT/Summarised_expression_canine_ICs - median.csv', row.names=FALSE)
+
+#Cancer type as X axis
+
+candidate_cancers <- winners[,1]
+sum_cancers <- rowSums(winners[,-1])
+table_cancers <- data.frame(candidate_cancers, sum_cancers) 
+
+ggplot(table_cancers, aes(x=reorder(candidate_cancers, -sum_cancers), y=sum_cancers/44)) + 
+  geom_bar(stat="identity", fill="#009E73") +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  labs(x="Cancer type", y="Total normalized counts per 1 gene", title="Total IC expression by cancer type - median based") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(
+  "./OUTPUT/Total IC expression by cancer type - median based.png",
+  plot = last_plot(),
+  dpi = "print",
+  bg = "white",
+)
+
+#Gene as X axis
+
+candidate_genes <- colnames(winners[,-1])
+sum_genes <- colSums(winners[,-1])
+table_genes <- data.frame(candidate_genes, sum_genes) 
+
+ggplot(table_genes, aes(x=reorder(candidate_genes, -sum_genes), y=sum_genes/14)) + 
+  geom_bar(stat="identity", fill="#009E73") +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  labs(x="Gene", y="Median normalized counts per 1 cancer type", title="Total IC expression by gene  - median based") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(
+  "./OUTPUT/Total IC expression by gene- median based.png",
+  plot = last_plot(),
+  dpi = "print",
+  bg = "white",
+)
+
+#And here is a version of these MEDIAN based plots for combining into a figure with the heatmap. Notice, that for this purpose the entries must be in the normal order, not ordered by value.
+
+#To control the correct order of entries on the x axis replace scale_x_discrete(labels = NULL) with scale_x_discrete(guide = guide_axis(angle = 90)). I remove them though, even though I could remove them in image editor later, because they affect how much space is left for the actual plot with the given saving dimensions.
+
+#Y axis descriptions are tricky. I take medians from each cancer type, summarize them and then divide by the number of cancers or genes, so it's a mean of medians. And the final result applies to cancer type medians/individual samples, and genes, respectively.
+
+#Cancer type as X axis
+
+ggplot(table_cancers, aes(x = forcats::fct_relevel(candidate_cancers, condition_order), y=sum_cancers/44)) + 
+  geom_bar(stat="identity", fill="#A6A3A3") +
+  scale_x_discrete(labels = NULL) +
+  labs(x="Cancer type", y="Mean", title="Total IC expression by cancer type - median based") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_classic()
+
+ggsave(
+  "./OUTPUT/Combined figure - Total IC expression by cancer type - median based.png",
+  plot = last_plot(),
+  dpi = "print",
+  bg = "white",
+  width = 15,
+  height = 5,
+  units = "cm"
+)
+
+#Gene as X axis
+
+#I "reorder" candidate_genes on the x axis according to the order in candidate_genes, otherwise the plot would show the elements of this vector alphabetically on the x axis.
+
+ggplot(table_genes, aes(x=forcats::fct_relevel(candidate_genes, candidate_genes), y=sum_genes/14)) + 
+  geom_bar(stat="identity", fill="#A6A3A3") +
+  scale_x_discrete(labels = NULL) +
+  labs(x="Gene", y="Mean", title="Total IC expression by gene  - median based") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_classic()
+
+ggsave(
+  "./OUTPUT/Combined figure - Total IC expression by gene- median based.png",
+  plot = last_plot(),
+  dpi = "print",
+  bg = "white",
+  width = 30,
+  height = 5,
+  units = "cm"
+)
+```
+
+
+```{r}
+#IMMUNE CELLS MARKERS
+
+# To save a sheet as CSV separated by coma, I had to change Windows regional settings in Control Panel specifically (list separator there).
+
+CellMarkers <- read.csv(file = "./INPUT/Cell_markers_4.csv", sep = ";")
+
+#Markers IDs
+
+cells_selected <- CellMarkers$ID
+
+#Marker protein names
+
+cells_y_labels <- CellMarkers$Gene
+
+#Cancer names
+
+cells_x_labels <- newxlabels
+
+length(cells_selected)==length(cells_y_labels)
+
+#I was getting the subscript out of bounds error at the "cells_mycounts_selected <-" step below, because, again, some genes were not found in the results. To find them I used this code, which checks for each selected gene ID if mycounts has a row with such ID and if not it prints this ID. However you need to run it separately in the console or it may not display the result:
+
+for (i in cells_selected)
+{
+  if((any(row.names(mycounts) == i)) == "FALSE") {print(i)}
+  
+}
+
+#Obtaining the data
+cells_mycounts_selected <- as.data.frame(mycounts[cells_selected,])
+
+cells_mycounts2 <- rbind(colnames(cells_mycounts_selected), cells_mycounts_selected)
+
+rownames(cells_mycounts2)[1] <- "condition"
+
+cells_mycounts3 <- t(cells_mycounts2)
+
+#R fight
+
+cells_mycounts4 <- as.data.frame(cells_mycounts3)
+
+cells_mycounts4[,2:40] <- sapply(cells_mycounts4[,2:40],as.numeric)
+
+#Aggregate count data by condition column, the function applied is mean, and [,-1] ignores the "condition" column from agg
+
+cells_mean <- aggregate(cells_mycounts4[,-1], by=list(Condition=cells_mycounts4$condition), FUN=mean)
+
+cells_sd <- aggregate(cells_mycounts4[,-1], by=list(Condition=cells_mycounts4$condition), FUN=sd)
+
+
+#Converting data to long format for GGplot
+
+cells_long_mean <- gather(cells_mean, Gene, MEAN, ENSCAFG00000011565:ENSCAFG00000010352, factor_key=TRUE)
+
+cells_long_sd <- gather(cells_sd, Gene, SD, ENSCAFG00000011565:ENSCAFG00000010352, factor_key=TRUE)
+
+#Plot
+
+ggplot(data = cells_long_mean, aes(x = forcats::fct_relevel(Condition, condition_order), y=factor(Gene, levels = rev(levels(factor(Gene)))), fill= MEAN)) + 
+  geom_tile(color = "white") + 
+  coord_equal() +
+  scale_x_discrete(labels= cells_x_labels, guide = guide_axis(angle = 90)) +
+  scale_y_discrete(labels = rev(cells_y_labels)) +
+  labs(x="Cancer type", y="Cell marker")  + 
+  ggtitle("Expression of immune cell markers - MEAN") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(family = "sans", face = "bold", size = 12)) +
+  scale_fill_gradientn(colours = viridis(256, option = "viridis"), name = "Mean expression (log10)", trans = "log10", breaks = my_breaks, labels = my_breaks_labels)
+
+ggsave(
+  "./OUTPUT/Immune_cell_markers_MEAN.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 30,
+  height = 30,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = NULL,
+) 
+
+```
+
+```{r}
+#SUMMARIZED IMMUNE CELL MARKERS!
+
+#A copy for scaling count data
+cells_metric_2 <- cells_mean
+
+#preparing a list of cell type descriptors
+cells_types <- c(rep("Type", 1), rep("Infiltrate", 1), rep("T", 5), rep("Th1", 1), rep("T-reg", 1), rep("T-cytotoxic", 1), rep("Cytotoxic", 6), rep("NK", 4), rep("Exhausted", 4), rep("B", 5), rep("Macrophages", 6), rep("Neutrophils", 2), rep("Mast", 3))
+
+#Saving the table with added human-readable gene names
+cells_metric_2_export <- rbind(c("GENE", cells_y_labels), rbind(cells_types, cells_metric_2))
+write.csv(cells_metric_2_export,file="./OUTPUT/cells_metric_2_export.csv",row.names=T)
+
+#A vector of "average" for each gene
+cells_metric_vector <- colMeans(as.matrix(cells_metric_2[,c(-1)]))
+
+#T
+cells_metric_3 <- t(cells_metric_2[,-1])
+colnames(cells_metric_3) <- cells_metric_2[,1]
+
+#Normalization step: dividing each column by the vector, so that each gene-row is divided by its corresponding mean
+cells_metric_4 <- cells_metric_3/cells_metric_vector
+
+##Saving the table
+write.csv(cells_metric_4,file="./OUTPUT/cells_metric_4_export.csv",row.names=T)
+
+cells_metric_5 <- cbind(TYPE = cells_types[-1], cells_metric_4)
+
+
+#CLASSIC problems with not numeric, list, etc. Check type: str(x[,2])
+
+cells_metric_6 <- as.data.frame(cells_metric_5)
+
+#Saving the colnames, because the next step with unlist(x) will replace spaces in colnames with dots
+
+cells_metric_6_colnames <- colnames(cells_metric_6)
+
+cells_metric_6 <- cells_metric_6[,-1]
+
+cells_metric_6 <- data.frame(lapply(cells_metric_6, function(x) unlist(x)))
+
+cells_metric_6[1:14] <- sapply(cells_metric_6[1:14],as.numeric)
+
+#Re-insert classes
+
+cells_metric_6 <- cbind(TYPES = cells_types[-1], cells_metric_6)
+
+#Aggregating by cell type
+
+cells_metric_6_agg_mean <- aggregate(cells_metric_6[,-1], by=list(Type=cells_metric_6[,1]), FUN=mean)
+
+colnames(cells_metric_6_agg_mean) <- cells_metric_6_colnames 
+
+
+#Preparing for ggplot
+
+cells_metric_6_agg_mean_t <- t(cells_metric_6_agg_mean)
+
+colnames(cells_metric_6_agg_mean_t) <- cells_metric_6_agg_mean_t[1,]
+
+cells_metric_6_agg_mean_t <- cells_metric_6_agg_mean_t[-1,]
+
+cells_metric_6_agg_mean_t <- cbind(colnames(cells_metric_6_agg_mean)[-1], cells_metric_6_agg_mean_t)
+
+colnames(cells_metric_6_agg_mean_t)[1] <- "Condition"
+
+cells_metric_6_agg_mean_t_long <- gather(as.data.frame(cells_metric_6_agg_mean_t), Type, Count, B:Th1, factor_key=TRUE)
+
+#So it seems gather deals ok with numbers stored as char, but ggplot does not; hence this:
+cells_metric_6_agg_mean_t_long$Count <- as.numeric(cells_metric_6_agg_mean_t_long$Count)
+
+
+my_breaks_cells = c(0.1, 1, 10)
+my_breaks_labels_cells =c(-1, 0, 1)
+
+
+ggplot(data = cells_metric_6_agg_mean_t_long, aes(x = forcats::fct_relevel(Condition, condition_order), y = forcats::fct_relevel(Type, "Mast", "Neutrophils", "Macrophages", "B", "Exhausted", "NK", "Cytotoxic", "T-cytotoxic", "T-reg", "Th1", "T", "Infiltrate"), fill= Count)) + 
+  geom_tile(color = "white") + 
+  coord_equal() +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_y_discrete() +
+  labs(x="Cancer type", y="Cell Type")  + 
+  ggtitle("Cell Types") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(family = "sans", face = "bold", size = 12)) +
+  scale_fill_gradientn(colours = viridis(256, option = "viridis"), name = "Abundance score (log)", trans = "log10", breaks = my_breaks_cells, labels = my_breaks_labels_cells)
+
+
+ggsave(
+  "./OUTPUT/Cell_Types.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = NULL,
+) 
+
+```
+
+```{r}
+#IC INHIBITION-STIMULATION SCORE
+
+#Uploading ICs and their assigned classes
+icstat_markers <- read.csv(file = "./INPUT/IC_list_3.csv", sep = ";")
+
+#Markers IDs
+icstat_selected <- icstat_markers$ID
+
+#Marker protein names
+icstat_y_labels <- icstat_markers$Gene
+
+#Cancer names
+icstat_x_labels <- newxlabels
+
+#I was getting the subscript out of bounds error at the "icstat_mycounts_selected <-" step below, because, again, some genes were not found in the results. To find them I used this code, which checks for each selected gene ID if mycounts has a row with such ID and if not it prints this ID. However you need to run it separately in the console or it may not display the result:
+
+for (i in icstat_selected)
+{
+  if((any(row.names(mycounts) == i)) == "FALSE") {print(i)}
+  
+}
+
+#Obraining the data
+icstat_mycounts_selected <- as.data.frame(mycounts[icstat_selected,])
+
+icstat_mycounts2 <- rbind(colnames(icstat_mycounts_selected), icstat_mycounts_selected)
+
+rownames(icstat_mycounts2)[1] <- "condition"
+
+icstat_mycounts3 <- t(icstat_mycounts2)
+
+#R fight
+
+icstat_mycounts4 <- as.data.frame(icstat_mycounts3)
+
+icstat_mycounts4[2:45] <- sapply(icstat_mycounts4[2:45],as.numeric)
+
+#Aggregate count data by condition column, the function applied is mean, and [,-1] ignores the "condition" column from agg
+
+icstat_mean <- aggregate(icstat_mycounts4[,-1], by=list(Condition=icstat_mycounts4$condition), FUN=mean)
+
+icstat_sd <- aggregate(icstat_mycounts4[,-1], by=list(Condition=icstat_mycounts4$condition), FUN=sd)
+
+#CONTROL PLOT
+
+#Just in case I want to plot standard deviation too
+icstat_sd_long <- gather(icstat_sd, Gene, SD, ENSCAFG00000013184:ENSCAFG00000005750, factor_key=TRUE)
+
+#Converting MEAN data to long format for GGplot
+icstat_mean_long <- gather(icstat_mean, Gene, MEAN, ENSCAFG00000013184:ENSCAFG00000005750, factor_key=TRUE)
+
+
+ggplot(data = icstat_mean_long, aes(x = forcats::fct_relevel(Condition, condition_order), y=factor(Gene, levels = rev(levels(factor(Gene)))), fill = MEAN)) + 
+  geom_tile(color = "white") + 
+  coord_equal() +
+  scale_x_discrete(labels= icstat_x_labels, guide = guide_axis(angle = 90)) +
+  scale_y_discrete(labels = rev(icstat_y_labels)) +
+  labs(x="Cancer type", y="Genes")  + 
+  ggtitle("Expression - MEAN") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(family = "sans", face = "bold", size = 12)) +
+  scale_fill_gradientn(colours = viridis(256, option = "viridis"), name = "Mean expression (log10)", trans = "log10", breaks = my_breaks, labels = my_breaks_labels)
+
+ggsave(
+  "./OUTPUT/IC_mean_for_score.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 60,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = NULL,
+) 
+
+```
+
+```{r}
+#IC CLASS PLOT
+
+#A copy for scaling count data
+icstat_mean_2 <- icstat_mean
+
+#preparing a list class descriptors, length = numer of genes
+icstat_types <- c(rep("TYPE", 1), rep("Inhibitory", 21), rep("Stimulatory", 11), rep("Other", 12))
+
+#Saving the table with added human-readable gene names
+icstat_mean_2_ICS_export <- rbind(c("GENE", icstat_y_labels), rbind(icstat_types, icstat_mean_2))
+write.csv(icstat_mean_2_ICS_export,file="./OUTPUT/icstat_mean_2_ICS_export.csv",row.names=T)
+
+#NORMALIZING THE DATA FOR WIDELY DIFFERENT ORDER OF MAGNITUDES OF DIFFERENT GENES
+
+#A vector of "average" for each gene; why mean? I wanted medians, but NKG2A has mostly 0s, so median is 0 and when I divide the values by this normalizing vector I get NAs/Inf in this gene due to dividing by 0.
+
+gene_means_vector <- colMeans(as.matrix(icstat_mean_2[,c(-1)]))
+
+# Because R cannot divide a df ROWS by a vector (or by a medians column I was adding previously)
+icstat_mean_3 <- t(icstat_mean_2[,-1])
+colnames(icstat_mean_3) <- icstat_mean_2[,1]
+
+#Normalization step
+icstat_mean_4 <- icstat_mean_3/gene_means_vector
+
+##Saving the table
+write.csv(icstat_mean_4,file="./OUTPUT/icstat_mean_4_IC_export.csv",row.names=T)
+
+icstat_mean_5 <- cbind(TYPE = icstat_types[-1], icstat_mean_4)
+
+# CLASSIC problems with not numeric, list, etc. Check type: str(icstat_median_6[,2]) or sapply(icstat_median_6, class) 
+
+icstat_mean_6 <- as.data.frame(icstat_mean_5)
+
+#Saving the colnames, because the next step with unlist(x) will replace spaces in colnames with dots
+
+icstat_mean_6_colnames <- colnames(icstat_mean_6)
+
+icstat_mean_6 <- icstat_mean_6[,-1]
+
+icstat_mean_6 <- data.frame(lapply(icstat_mean_6, function(x) unlist(x)))
+
+#Recovering colnames without dots saved above
+
+#(icstat_mean_6) <- icstat_mean_6_colnames[-1]
+
+icstat_mean_6[1:14] <- sapply(icstat_mean_6[1:14],as.numeric)
+
+#Re-insert classes
+
+icstat_mean_6 <- cbind(icstat_types[-1], icstat_mean_6)
+
+#Aggregating by IC type
+
+icstat_mean_6_agg_mean <- aggregate(icstat_mean_6[,-1], by=list(Type=icstat_mean_6[,1]), FUN=mean)
+
+colnames(icstat_mean_6_agg_mean) <- icstat_mean_6_colnames 
+
+#Preparing for ggplot
+
+icstat_mean_6_agg_mean_t <- t(icstat_mean_6_agg_mean)
+
+colnames(icstat_mean_6_agg_mean_t) <- icstat_mean_6_agg_mean_t[1,]
+
+icstat_mean_6_agg_mean_t <- icstat_mean_6_agg_mean_t[-1,]
+
+icstat_mean_6_agg_mean_t <- cbind(colnames(icstat_mean_6_agg_mean)[-1], icstat_mean_6_agg_mean_t)
+
+colnames(icstat_mean_6_agg_mean_t)[1] <- "Condition"
+
+icstat_mean_6_agg_mean_t_long <- gather(as.data.frame(icstat_mean_6_agg_mean_t), Type, Count, Inhibitory:Stimulatory, factor_key=TRUE)
+
+#So it seems gather deals ok with numbers stored as char, but ggplot does not; hence this:
+icstat_mean_6_agg_mean_t_long$Count <- as.numeric(icstat_mean_6_agg_mean_t_long$Count)
+
+my_breaks_icstat = c(1, 2, 3, 4)
+my_breaks_labels_icstat =c(1, 2, 3, 4)
+
+
+ggplot(data = icstat_mean_6_agg_mean_t_long, aes(x = forcats::fct_relevel(Condition, condition_order), y = forcats::fct_relevel(Type, "Other", "Stimulatory", "Inhibitory"), fill= Count)) + 
+  geom_tile(color = "white") + 
+  coord_equal() +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_y_discrete() +
+  labs(x="Cancer type", y="IC Class")  + 
+  ggtitle("IC_classes_means") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(family = "sans", face = "bold", size = 12)) +
+  scale_fill_gradientn(colours = viridis(256, option = "viridis"), name = "Abundance score", trans = "log10", breaks = my_breaks_icstat, labels = my_breaks_labels_icstat)
+
+
+ggsave(
+  "./OUTPUT/IC_classes_means.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = NULL,
+) 
+
+#IC INHIBITION SCORE BARPLOT
+
+icstat_ratio <- as.numeric(icstat_mean_6_agg_mean_t[,2])/as.numeric(icstat_mean_6_agg_mean_t[,4])
+
+table_icstats <- data.frame(icstat_mean_6_agg_mean_t[,1], icstat_ratio) 
+
+
+#Cancer type as X axis
+
+ggplot(table_icstats, aes(x = forcats::fct_relevel(icstat_mean_6_agg_mean_t[,1], condition_order), y=icstat_ratio)) + 
+  geom_bar(stat="identity", fill="#A6A3A3") +
+  scale_x_discrete(labels = NULL) +
+  labs(x="Cancer type", y="INH / STIM", title="Inh-Stim_Score") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_classic()
+
+ggsave(
+  "./OUTPUT/InhStim_Score.png",
+  plot = last_plot(),
+  dpi = "print",
+  bg = "white",
+  width = 15,
+  height = 5,
+  units = "cm"
+)
+```
+
+```{r}
+#IC CLASS PLOT WITHOUT LYMPHOMAS
+
+#Without lymphomas, as they are cancer of lymphocytes and expected to be different, and in fact TCL disrupts the visualization, because it is so high count. Important to remove TCL&BCL before any calculations, as they could impact the mean level of each gene. And now I can plot on a linear scale, which is more intuitive when there is a small range of data.
+
+#Removing lymphomas from the dataset:
+icstat_mean_2 <- icstat_mean[-c(2,13),]
+
+#preparing a list class descriptors, length = numer of genes
+icstat_types <- c(rep("TYPE", 1), rep("Inhibitory", 21), rep("Stimulatory", 11), rep("Other", 12))
+
+#Saving the table with added human-readable gene names
+icstat_mean_2_ICS_export <- rbind(c("GENE", icstat_y_labels), rbind(icstat_types, icstat_mean_2))
+write.csv(icstat_mean_2_ICS_export,file="./OUTPUT/icstat_mean_2_ICS_export.csv",row.names=T)
+
+#NORMALIZING THE DATA FOR WIDELY DIFFERENT ORDER OF MAGNITUDES OF DIFFERENT GENES
+
+#A vector of "average" for each gene
+
+gene_means_vector <- colMeans(as.matrix(icstat_mean_2[,c(-1)]))
+
+icstat_mean_3 <- t(icstat_mean_2[,-1])
+colnames(icstat_mean_3) <- icstat_mean_2[,1]
+
+#Normalization step
+icstat_mean_4 <- icstat_mean_3/gene_means_vector
+
+##Saving the table
+write.csv(icstat_mean_4,file="./OUTPUT/icstat_mean_4_IC_export.csv",row.names=T)
+
+icstat_mean_5 <- cbind(icstat_types[-1], icstat_mean_4)
+colnames(icstat_mean_5)[1] <- "TYPE"
+
+icstat_mean_6 <- as.data.frame(icstat_mean_5)
+
+#Saving the colnames, because the next step with unlist(x) will replace spaces in colnames with dots
+
+icstat_mean_6_colnames <- colnames(icstat_mean_6)
+
+icstat_mean_6 <- icstat_mean_6[,-1]
+
+icstat_mean_6 <- data.frame(lapply(icstat_mean_6, function(x) unlist(x)))
+
+#Recovering colnames without dots saved above
+
+icstat_mean_6[1:12] <- sapply(icstat_mean_6[1:12],as.numeric)
+
+#Re-insert classes
+
+icstat_mean_6 <- cbind(icstat_types[-1], icstat_mean_6)
+
+#Aggregating by cell type
+
+icstat_mean_6_agg_mean <- aggregate(icstat_mean_6[,-1], by=list(Type=icstat_mean_6[,1]), FUN=mean)
+
+colnames(icstat_mean_6_agg_mean) <- icstat_mean_6_colnames 
+
+#Preparing for ggplot
+
+icstat_mean_6_agg_mean_t <- t(icstat_mean_6_agg_mean)
+
+colnames(icstat_mean_6_agg_mean_t) <- icstat_mean_6_agg_mean_t[1,]
+
+icstat_mean_6_agg_mean_t <- icstat_mean_6_agg_mean_t[-1,]
+
+icstat_mean_6_agg_mean_t <- cbind(colnames(icstat_mean_6_agg_mean)[-1], icstat_mean_6_agg_mean_t)
+
+colnames(icstat_mean_6_agg_mean_t)[1] <- "Condition"
+
+icstat_mean_6_agg_mean_t_long <- gather(as.data.frame(icstat_mean_6_agg_mean_t), Type, Count, Inhibitory:Stimulatory, factor_key=TRUE)
+
+#So it seems gather deals ok with numbers stored as char, but ggplot does not; hence this:
+icstat_mean_6_agg_mean_t_long$Count <- as.numeric(icstat_mean_6_agg_mean_t_long$Count)
+
+#condition_order[-c(1,2)] - removing lymphomas from the condition list, corresponding to icstat_mean[-c(2,13),] earlier.
+
+my_breaks_icstat = c(0, 0.5, 1, 1.5, 2)
+my_breaks_labels_icstat =c(0, 0.5, "1.0", 1.5, "2.0")
+
+ggplot(data = icstat_mean_6_agg_mean_t_long, aes(x = forcats::fct_relevel(Condition, condition_order[-c(1,2)]), y = forcats::fct_relevel(Type, "Other", "Stimulatory", "Inhibitory"), fill= Count)) + 
+  geom_tile(color = "white") + 
+  coord_equal() +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_y_discrete() +
+  labs(x="Cancer type", y="IC Class")  + 
+  ggtitle("IC Classes") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(family = "sans", face = "bold", size = 12)) +
+  scale_fill_gradientn(colours = viridis(256, option = "viridis"), name = "Abundance score", trans = "identity", breaks = my_breaks_icstat, labels = my_breaks_labels_icstat)
+
+
+ggsave(
+  "./OUTPUT/IC_classes_means_NoLymphomas.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = NULL,
+) 
+
+#IC INHIBITION SCORE BARPLOT
+
+icstat_ratio <- as.numeric(icstat_mean_6_agg_mean_t[,2])/as.numeric(icstat_mean_6_agg_mean_t[,4])
+
+table_icstats <- data.frame(icstat_mean_6_agg_mean_t[,1], icstat_ratio) 
+
+#Cancer type as X axis
+
+ggplot(table_icstats, aes(x = forcats::fct_relevel(icstat_mean_6_agg_mean_t[,1], condition_order[-c(1,2)]), y=icstat_ratio)) + 
+  geom_bar(stat="identity", fill="#A6A3A3") +
+  scale_x_discrete(labels = NULL) +
+  labs(x="Cancer type", y="INH / STIM", title="Inh-Stim_Score") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_classic()
+
+ggsave(
+  "./OUTPUT/InhStim_Score_NoLymphomas.png",
+  plot = last_plot(),
+  dpi = "print",
+  bg = "white",
+  width = 15,
+  height = 5,
+  units = "cm"
+)
+
+
+```
+
+
+```{r}
+#Compressed "green" boxplot meant for 4 pages
+
+#Cut it into 4 pages and paste the x axis description on each.
+#The horizontal line in boxplots is median.
+#A4 size is 210x297 FYI.
+#free_y - adds the x axis labels only in the lowest panel
+
+ggplot(mycounts_long3, aes(x = forcats::fct_relevel(condition, condition_order), y=log10(Count + 1))) +
+  geom_boxplot(outlier.shape = NA, fill="#009E73", ) +
+  facet_wrap(. ~ Gene, ncol=2, scales = "free_y", labeller = labeller(Gene = gene.labs)) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  geom_point(alpha=0.2, size=2) +
+  theme(strip.text.y = element_text(size=12, angle=0)) +
+  theme(legend.position = "none") +
+  labs(x="cancer study", y="") + 
+  ggtitle("Canine ICs - counts normalized by DESeq2 - log10(Counts +1)") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(
+  "./OUTPUT/Compressed green boxplot - log10.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 210, 
+  height = 1000, 
+  units = "mm",  
+  dpi = "print",
+  limitsize = FALSE,
+  bg = "white",
+)
+
+```
+
+```{r}
+#TPM SIGNATURES
+
+#Importing the DOG TPM values for my samples
+
+#Importing TPMs imported already by tximport
+TPM_Table <- txi$abundance
+
+#Collapsing reps like before
+write.csv(TPM_Table,file="./OUTPUT/TPM_Table.csv",row.names=T)
+
+#Add the replicate row to the data
+TPM_Table_rep <- rbind(sample_reps, TPM_Table)
+
+#Save for control
+write.csv(TPM_Table_rep,file="./OUTPUT/TPM_Table_rep.csv",row.names=T)
+
+#Transposing cause R won't gather by row not column...
+TPM_Table_rep_t <- t(TPM_Table_rep)
+
+##Collapsing replicates
+TPM_Table_rep_t_agg <- aggregate(TPM_Table_rep_t[,-1], by=list(Rep_num=TPM_Table_rep_t[, 1]), FUN=sum)
+
+#Check the sizes before and after collapsing "replicates"
+dim(TPM_Table_rep_t)
+dim(TPM_Table_rep_t_agg)
+
+#Adding back the condition type to the aggregated data frame, but unlike "condition", it has the number of cancer types AFTER the aggregation, so less OSs and UCs
+
+condition_TPM = factor(c(rep("ameloblastoma", 11), rep("B-cell lymphoma", 12), rep("mammary cancers", 158), rep("glioma", 42), rep("hemangiosarcoma", 45), rep("hemangiosarcoma", 8), rep("insulinoma", 6), rep("melanoma", 12), rep("meningioma", 13), rep("osteosarcoma", 31), rep("oral squamous cell carcinoma", 10), rep("prostate carcinoma", 11), rep("lung carcinoma", 12), rep("T-cell lymphoma", 12), rep("T-cell lymphoma", 6), rep("urothelial carcinoma", 29)))
+
+#checking if the number is right - needs to be the same as the number of "files"
+length(condition_TPM)
+dim(TPM_Table_rep_t_agg)
+
+#Replacing the replicate row with cancer type name; if it causes problems, use numbers, not names
+TPM_Table2 <- cbind(condition_TPM, TPM_Table_rep_t_agg[, -1])
+
+#Processing the TPMs to a cancer-type identified matrix of medians 
+TPM_Table_medians <- aggregate(TPM_Table2[,-1], by=list(Condition=TPM_Table2$condition_TPM), FUN=median)
+
+```
+
+```{r}
+#Further Dog TPM processing 
+
+#Keeping the rows of interest
+
+selected3 <- c("ENSCAFG00000013184", "ENSCAFG00000002120", "ENSCAFG00000002121", "ENSCAFG00000023455", "ENSCAFG00000018641","ENSCAFG00000014675", "ENSCAFG00000032313", "ENSCAFG00000012876", "ENSCAFG00000012872", "ENSCAFG00000010997", "ENSCAFG00000011751", "ENSCAFG00000010817", "ENSCAFG00000012722", "ENSCAFG00000004666", "ENSCAFG00000025524", "ENSCAFG00000009887", "ENSCAFG00000014498", "ENSCAFG00000014354", "ENSCAFG00000009858", "ENSCAFG00000013828", "ENSCAFG00000013933", "ENSCAFG00000012880", "ENSCAFG00000010718", "ENSCAFG00000019328", "ENSCAFG00000057149", "ENSCAFG00000019673", "ENSCAFG00000030400", "ENSCAFG00000009994", "ENSCAFG00000018945", "ENSCAFG00000015149", "ENSCAFG00000030308", "ENSCAFG00000000038", "ENSCAFG00000019329", "ENSCAFG00000014590", "ENSCAFG00000019422", "ENSCAFG00000018627", "ENSCAFG00000055618", "ENSCAFG00000010480", "ENSCAFG00000028587", "ENSCAFG00000017820", "ENSCAFG00000010358", "ENSCAFG00000012598", "ENSCAFG00000000386", "ENSCAFG00000005750")
+
+names3 <- c("PD-1", "PD-L1", "PD-L2", "TIM-3", "GAL-9", "LAG-3", "FGL-1", "CTLA-4", "CD28", "CD80", "CD86", "TIGIT", "NECTIN4", "CD155", "SIRPA", "CD47", "PVRIG", "VISTA", "B7-H4", "A2AR", "NOX2", "ICOS", "ICOSLG", "OX40", "OX40L", "4-1BB", "4-1BBL", "CD40", "CD40L", "CD27", "CD70", "CD226", "GITR", "GITRL", "HVEM", "LIGHT", "CD160", "BTLA", "NKG2A", "B7-H3", "TACTILE", "SLAMF7", "Arginase 1", "IDO")
+
+# keep the column with cancer type
+stay <- c("Condition", selected3)
+
+TPM_Dog <- TPM_Table_medians[,stay]
+
+# modifying canine names like for human:
+
+TPM_Dog[,1] <- paste(TPM_Dog[,1],"(canine)",sep=" ")
+
+#making an "illegal" plot like for the main analysis of ICs, but using TPMs, for comparison
+
+TPM_Dog_long <- gather(TPM_Dog, Gene, Count, ENSCAFG00000013184:ENSCAFG00000005750, factor_key=TRUE)
+
+gg_function_3(TPM_Dog_long, TPM_Dog_long$Count, "Cancer type", "Immune checkpoints", "Dog Median TPM of ICs - Log10", "viridis", "median (log10)", "log10", my_breaks, my_breaks_labels)
+
+#Very interestingly it gives quite similar results in terms of relative intensity/colour, although with differences significant for comparisons, but clearly there is a lot changing for UC and Insulinoma, when I plot the TPMs. Just as a reminder, this plot, based on TPMs, cannot be used for reliable comparisons, like the DESeq2-normalized one can.
+
+# Getting a table of 4 genes of interest for publication
+
+TPM_4genes_dog <- rbind(c("", names3), TPM_Dog)
+colnames(TPM_4genes_dog) <- TPM_4genes_dog[1,]
+rownames(TPM_4genes_dog) <- TPM_4genes_dog[,1]
+TPM_4genes_dog <- TPM_4genes_dog[-1,c("A2AR", "OX40", "CD160", "NKG2A")]
+
+write.csv(TPM_4genes_dog,file="./OUTPUT/TPM_4genes_dog.csv", row.names=T, col.names = T)
+```
+
+```{r}
+#Importing the HUMAN TPM data from the EBI file
+
+#How was the human data aggregated from individual cases to disease level by EBI? Appears that it is a median. Which is good, because it matched the method I used for aggregating my dog TPM.
+
+#check.names=FALSE lets it import the column names as they are originally, without it the spaces and dashes are converted to dots
+
+TPM_Human <- read.csv(file = "./INPUT/TPM_Human_EBI_processed.csv", sep = ";", check.names=FALSE)
+
+colnames(TPM_Human)[-1] <- paste(colnames(TPM_Human)[-1],"(human)",sep=" ")
+
+#Correcting an ugly random name of the first column
+colnames(TPM_Human)[1] <- c("IC")
+
+#Illegal plot of human data - data prep
+
+TPM_Human_long <- gather(TPM_Human, Condition, Count, "B-cell non-Hodgkin lymphoma (human)":"endometrial adenocarcinoma (human)", factor_key=TRUE)
+
+colnames(TPM_Human_long)[1] <- c("Gene")
+
+#Gene names (the ones I used for dog) adapted for the order of the human table (which is alphabetic, with different names in some cases)
+
+```
+
+```{r}
+#Human TPM Plot
+
+#Preparing the order of genes to display based on the list I prepared for dog, where the genes are put in clusters of interest, starting from PD-1, not alphabetic at all
+
+TPM_Gene_Order <- names2
+
+ggplot(data = TPM_Human_long, aes(x = Condition, y= factor(Gene,levels = rev(TPM_Gene_Order)), fill= TPM_Human_long$Count)) + 
+    geom_tile(color = "white") + 
+    coord_equal() +
+    scale_x_discrete(guide = guide_axis(angle = 90)) +
+    scale_y_discrete() +
+    labs(x="Cancer type", y="Immune checkpoints")  + 
+    ggtitle("Human Median TPM of ICs - Log10") +
+    theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(family = "sans", face = "bold", size = 12)) +
+    scale_fill_gradientn(colours = viridis(256, option = "viridis"), name = "median (log10)", trans = "log10", breaks = my_breaks, labels = my_breaks_labels)
+  
+  ggsave(
+    filename = "./OUTPUT/Heatmap - Human Median TPM of ICs - Log10.png",
+    plot = last_plot(),
+    device = "png",
+    path = "./",
+    scale = 1,
+    width = 30,
+    height = 30,
+    units = "cm",
+    dpi = "print",
+    limitsize = TRUE,
+    bg = NULL,
+  ) 
+```
+
+
+```{r}
+#PREPARING A HUMAN-DOG MERGED MEDIANS DATASET
+
+#Changing the ENSCAFG names to human readable names like in the Human TPM table
+
+#DOG
+
+TPM_Dog_prep <- TPM_Dog
+
+colnames(TPM_Dog_prep)[-1] <- names2
+
+#Transposing this one so that I can standardize both tables, and standardization happens for columns
+
+TPM_Dog_prep <- t(TPM_Dog_prep)
+
+#Getting both matrices to have rownames and colnames and only numbers in the data
+
+colnames(TPM_Dog_prep) <- TPM_Dog_prep[1,]
+
+TPM_Dog_prep <- TPM_Dog_prep[-1, ]
+
+#HUMAN
+
+TPM_Human_prep <- TPM_Human
+
+rownames(TPM_Human_prep) <- TPM_Human_prep[,1]
+
+TPM_Human_prep <- TPM_Human_prep[,-1]
+
+#Reordering the rows (genes) in Human.
+
+TPM_Human_prep <- arrange(TPM_Human_prep, factor(rownames(TPM_Human_prep), levels = names2))
+
+# Replacing NAs with 0s in the human data, as I learned this is what my null values from EBI are.
+
+TPM_Human_prep[is.na(TPM_Human_prep)] <- 0
+
+# Small plug to export a table of 4 key genes from human TPMs
+
+TPM_4genes_human <- t(TPM_Human_prep)
+TPM_4genes_human <- TPM_4genes_human[,c("A2AR", "OX40", "CD160", "NKG2A")]
+write.csv(TPM_4genes_human,file="./OUTPUT/TPM_4genes_human.csv",row.names=T, col.names=T)
+
+#BOTH SPECIES - standardizing data according to 
+#https://www.datanovia.com/en/lessons/clustering-distance-measures/
+
+TPM_Dog_prep <- as.data.frame(TPM_Dog_prep)
+
+TPM_Dog_prep[1:14] <- sapply(TPM_Dog_prep[1:14],as.numeric)
+
+#Standardizing TPM data
+#https://www.rdocumentation.org/packages/base/versions/3.6.2/topics/scale
+
+#20230202 I have genes as rows and cancers as columns; scaling works on a columns; hence I normalize genes in the cancer type, so that all cancer types are on a similar scale, which matters for linear (Euclidean) but not correlation (Pearson) comparison 
+
+TPM_Dog_stand <- scale(TPM_Dog_prep)
+
+TPM_Human_stand <- scale(TPM_Human_prep)
+
+#Merging TPM tables
+
+#A note: human ones are rounded to wholes, while dog ones have decimal spaces; also, I need to distinguish which ones are canine, but I don't need to add anything, as the human and canine cancer names are written in a different way here
+
+TPM_merged <- cbind(TPM_Dog_prep, TPM_Human_prep)
+
+TPM_merged_standardized <- cbind(TPM_Dog_stand, TPM_Human_stand)
+
+#Transposing the tables again, because the distance matrix functions I read about usually calculate distances between rows, so I need cancer types to be rows. At least it works nicely when all naming is in the colnames and rownames
+
+TPM_merged_t <- t(TPM_merged)
+
+TPM_merged_standardized_t <- t(TPM_merged_standardized)
+
+
+# Exporting the dataframes that were used later for creating distance matrices and hierarchical clustering.
+
+write.csv(TPM_merged, file="./OUTPUT/TPM_merged.csv",row.names=T)
+
+write.csv(TPM_merged_standardized, file="./OUTPUT/TPM_merged_standardized.csv",row.names=T)
+
+```
+
+
+```{r}
+# Robust distance matrix creation with amap::Dist
+
+# Alternative was factoextra::get_dist, but did not accept NA values. Here, missing values are allowed, and are excluded from all computations involving the rows within which they occur. If some columns are excluded in calculating a Euclidean, Manhattan or Canberra distance, the sum is scaled up proportionally to the number of columns used. If all pairs are excluded when calculating a particular distance, the value is "NA".
+
+# Notice the R base function is dist(), and here it is Dist(), for safety define that you mean amap::Dist function.
+# This library has a few Pearson-based methods. 
+# https://stackoverflow.com/questions/23891391/uncentered-pearson-correlation
+# https://www.datanovia.com/en/lessons/clustering-distance-measures/
+# Without the "as.matrix" row the output is in the Values, not Data and cannot be opened as a table
+
+# fviz_dist visualization can be customized:
+# https://www.rdocumentation.org/packages/factoextra/versions/1.0.7/topics/dist
+
+# required library(amap), library(factoextra)
+
+#Pearson
+
+amap.dist.pear <- amap::Dist(TPM_merged_t, method = "correlation")
+amap.dist.pear.matrix <- as.matrix(amap.dist.pear)
+
+png(file="./OUTPUT/amap-dist-pear.png", width = 4450, height = 4000, res = 300)
+fviz_dist(amap.dist.pear)
+dev.off()
+
+write.csv(amap.dist.pear.matrix, file="./OUTPUT/amap-dist-pear.csv",row.names=T)
+
+amap.dist.stand.pear <- amap::Dist(TPM_merged_standardized_t, method = "correlation")
+amap.dist.stand.pear.matrix <- as.matrix(amap.dist.stand.pear)
+
+png(file="./OUTPUT/amap-dist-stand-pear.png", width = 4450, height = 4000, res = 300)
+fviz_dist(amap.dist.stand.pear)
+dev.off()
+
+write.csv(amap.dist.stand.pear.matrix, file="./OUTPUT/amap-dist-stand-pear.csv",row.names=T)
+```
+
+```{r}
+# Preparing data to analyse thresholds of similarity in Excel
+
+# Now, just to make setting thresholds and such easier, I also run the chosen method (standardized Pearson) on dog and human separately. Transposing in the process, because the merged matrices were transposed later for analysis.
+
+# Dog
+
+amap.dog.dist.stand.pear <- amap::Dist(t(TPM_Dog_stand), method = "correlation")
+amap.dog.dist.stand.pear.matrix <- as.matrix(amap.dog.dist.stand.pear)
+
+png(file="./OUTPUT/amap-dog-dist-stand-pear.png", width = 4450, height = 4000, res = 300)
+fviz_dist(amap.dog.dist.stand.pear)
+dev.off()
+
+write.csv(amap.dog.dist.stand.pear.matrix, file="./OUTPUT/amap-dog-dist-stand-pear.csv",row.names=T)
+
+# Human
+
+amap.human.dist.stand.pear <- amap::Dist(t(TPM_Human_stand), method = "correlation")
+amap.human.dist.stand.pear.matrix <- as.matrix(amap.human.dist.stand.pear)
+
+png(file="./OUTPUT/amap-human-dist-stand-pear.png", width = 4450, height = 4000, res = 300)
+fviz_dist(amap.human.dist.stand.pear)
+dev.off()
+
+write.csv(amap.human.dist.stand.pear.matrix, file="./OUTPUT/amap-human-dist-stand-pear.csv",row.names=T)
+
+# Calculating the values, omitting the cells with 0 (these are only the diagonal results for same cancers I assume), of which I am mainly interested in the canine median and min.
+
+#Dog
+
+print("median dog")
+median(amap.dog.dist.stand.pear.matrix[amap.dog.dist.stand.pear.matrix>0])
+print("mean dog")
+mean(amap.dog.dist.stand.pear.matrix[amap.dog.dist.stand.pear.matrix>0])
+print("minimum dog")
+min(amap.dog.dist.stand.pear.matrix[amap.dog.dist.stand.pear.matrix>0])
+print("maximum dog")
+max(amap.dog.dist.stand.pear.matrix[amap.dog.dist.stand.pear.matrix>0])
+
+#Human
+
+print("median human")
+median(amap.human.dist.stand.pear.matrix[amap.human.dist.stand.pear.matrix>0])
+print("mean human")
+mean(amap.human.dist.stand.pear.matrix[amap.human.dist.stand.pear.matrix>0])
+print("minimum human")
+min(amap.human.dist.stand.pear.matrix[amap.human.dist.stand.pear.matrix>0])
+print("maximum human")
+max(amap.human.dist.stand.pear.matrix[amap.human.dist.stand.pear.matrix>0])
+```
+
+
+```{r}
+# H-CLUST HIERARCHICAL CLUSTERING DENDROGRAM
+
+# Apparently the current version of base function "plot" is limited and I cannot use parameters such as horiz = TRUE or type = "rectangle" hence I try my luck with a non-default vis option. But even with fviz_dend there is no longer a triangle type available, and type "phylogenic" requires an igraph library - library(igraph).
+
+# My matrix for input: amap.dist.stand.pear.matrix
+
+# Preparing renaming to have n number of patients on the dendrogram
+
+# check current names of columns which are also names of rows of the distance matrix
+dendro_rename1 <- colnames(amap.dist.stand.pear.matrix)
+
+# define the names of columns/rows that were correct at the moment of preparing the renaming vector below
+dendro_rename2 <- c("ameloblastoma (canine)", "B-cell lymphoma (canine)", "glioma (canine)", "hemangiosarcoma (canine)", "insulinoma (canine)", "lung carcinoma (canine)", "mammary cancers (canine)", "melanoma (canine)", "meningioma (canine)", "oral squamous cell carcinoma (canine)", "osteosarcoma (canine)", "prostate carcinoma (canine)", "T-cell lymphoma (canine)", "urothelial carcinoma (canine)", "B-cell non-Hodgkin lymphoma (human)", "chronic lymphocytic leukemia (human)", "lymphoma (human)", "glioblastoma multiforme (human)", "glioma (human)", "breast adenocarcinoma (human)", "invasive lobular carcinoma (human)", "esophageal adenocarcinoma (human)", "chromophobe renal cell carcinoma (human)", "renal cell carcinoma (human)", "colorectal adenocarcinoma (human)", "cholangiocarcinoma (human)", "hepatocellular carcinoma (human)", "lung adenocarcinoma (human)", "squamous cell lung carcinoma (human)", "head and neck squamous cell carcinoma (human)", "ovarian adenocarcinoma (human)", "pancreatic adenocarcinoma (human)", "prostate adenocarcinoma (human)", "sarcoma (human)", "melanoma (human)", "gastric adenocarcinoma (human)", "follicular thyroid carcinoma (human)", "bladder transitional cell carcinoma (human)", "cervical adenocarcinoma (human)", "cervical squamous cell carcinoma (human)", "endometrial adenocarcinoma (human)")  
+
+# define the new names with the n number added
+dendro_rename3 <- c("ameloblastoma (canine, n=11)", "B-cell lymphoma (canine, n=12)", "glioma (canine. n=42)", "hemangiosarcoma (canine, n=53)", "insulinoma (canine, n=6)", "lung carcinoma (canine, n=12)", "mammary cancers (canine, n=158)", "melanoma (canine, n=12)", "meningioma (canine, n=13)", "oral squamous cell carcinoma (canine, n=10)", "osteosarcoma (canine, n=31)", "prostate carcinoma (canine, n=11)", "T-cell lymphoma (canine, n=18)", "urothelial carcinoma (canine, n=29)", "B-cell non-Hodgkin lymphoma (human, n=103)", "chronic lymphocytic leukemia (human, n=68)", "lymphoma (human, n=2)", "glioblastoma multiforme (human, n=28)", "glioma (human, n=18)", "breast adenocarcinoma (human, n=91)", "invasive lobular carcinoma (human, n=6)", "esophageal adenocarcinoma (human, n=7)", "chromophobe renal cell carcinoma (human, n=57)", "renal cell carcinoma (human, n=154)", "colorectal adenocarcinoma (human, n=51)", "cholangiocarcinoma (human, n=34)", "hepatocellular carcinoma (human, n=153)", "lung adenocarcinoma (human, n=46)", "squamous cell lung carcinoma (human, n=49)", "head and neck squamous cell carcinoma (human, n=43)", "ovarian adenocarcinoma (human, n=101)", "pancreatic adenocarcinoma (human, n=75)", "prostate adenocarcinoma (human, n=20)", "sarcoma (human, n=34)", "melanoma (human, n=36)", "gastric adenocarcinoma (human, n=31)", "follicular thyroid carcinoma (human, n=51)", "bladder transitional cell carcinoma (human, n=27)", "cervical adenocarcinoma (human, n=2)", "cervical squamous cell carcinoma (human, n=18)", "endometrial adenocarcinoma (human, n=45)")   
+
+# rename rows and columns conditionally: only if the current row/col-names are the same as when I was preparing the renamed vector, meaning the dataset has not changed
+
+amap.dist.stand.pear.matrix_rename <- amap.dist.stand.pear.matrix
+
+if (identical(dendro_rename1, dendro_rename2)) {
+  colnames(amap.dist.stand.pear.matrix_rename) <- dendro_rename3
+  rownames(amap.dist.stand.pear.matrix_rename) <- dendro_rename3
+} else {
+  stop("ERROR! DATA NAMES CHANGED!")
+}
+
+# without as.dist you will get a table of data for some reason, that is not a full Dist class object
+clustering.matrix <- as.dist(amap.dist.stand.pear.matrix_rename)
+
+# Hclust can be performed with various methods:
+# https://www.rdocumentation.org/packages/stats/versions/3.6.2/topics/hclust
+
+hclust.output <- hclust(clustering.matrix, method = "ward.D2")
+
+#https://search.r-project.org/CRAN/refmans/factoextra/html/fviz_dend.html
+#https://rpkgs.datanovia.com/factoextra/reference/fviz_dend.html
+
+# !!! THE LABELS NEED TO BE REORDERED IF THE DENDROGRAM IS PLOTTED WITH ANY CHANGES ]
+
+# Colour human and dog labels differentially
+dendrogram_labels_col <- c(1,2,1,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,1,2,1,1,1,2,2,2,2,2,2,2,2,2,2)
+
+# Distinguish human/dog by font - R fontfaces: 1=plain, 2=bold, 3=italic, 4=bold-italic.
+dendrogram_fonts <- dendrogram_labels_col
+
+# Prepare a colour scheme for rectangle fill and border. "jco" looked good with 8 clusters or so. Colour palettes that are accepted by fviz and seem to be giving decent results with 15 clusters to colour: startrek, rickandmorty, locuszoom
+
+dendrogram_colours <- "locuszoom"
+
+# Prepare the dendrogram
+
+# To have labels in the colours of the clusters change color_labels_by_k to false. Add "label_cols = dendrogram_labels_col" to distinguish human/dog by label colour too
+
+dendrogram_graph <- fviz_dend(x = hclust.output, cex = 0.4, lwd = 0.4, type = "rectangle", horiz = TRUE, labels_track_height = 1, rect = TRUE, rect_fill = TRUE, lower_rect = -1.7, k_colors = dendrogram_colours, rect_border = dendrogram_colours, xlab = "Cancer type", ylab = "Distance", sub = "", main = "Similarity of median IC expression patterns between canine (bold) and human cancer types ", font.main = 7, k=14, color_labels_by_k = FALSE)
+
+# USE AGAIN WHEN THE FINAL DENDROGRAM IS READY AND THE CORRECTED SPECIES VECTORS ABOVE
+# Apply the font faces, not possible in a simpler way
+
+dendrogram_graph$layers[[2]]$aes_params$fontface <- dendrogram_fonts
+
+# Generate the dendrogram
+dendrogram_graph
+
+# Save the dendrogram
+png(file="./OUTPUT/dendrogram_ward-ward.D2.png", res = 300, width = 1600, height = 1600)
+
+dendrogram_graph
+
+dev.off()
+
+```
+
+
+```{r}
+# UMAP
+
+# To see some of the generated data: DogHuman.umap, head(DogHuman.umap$layout, 3)
+# Behaviour of this library changed significantly over time! library(umap)
+
+# To get cancers and not genes comparison, I need to use transposed data like below.
+# UMAP on standardized and transposed data.
+# To run on non-standardized data, change the "TPM_merged_standardized_t" to "TPM_merged_t" for input (and the plot naming later)
+
+DogHuman.data <- TPM_merged_standardized_t
+DogHuman.labels <- rownames(TPM_merged_standardized_t)
+DogHuman.umap <- umap(DogHuman.data)
+plot(DogHuman.umap$layout) 
+
+# Labelled ggplot 
+
+umap_df <- as.data.frame(DogHuman.umap$layout)
+
+# hjust and vjust explained:
+# https://stackoverflow.com/questions/7263849/what-do-hjust-and-vjust-do-when-making-a-plot-using-ggplot
+
+# In this case it makes a difference that the order of theme_classic, remving the legend and geom_text_repel is like this, otherwise it still prints the legend which takes all the space, or returns an error.
+
+# Removing color = rownames(umap_df), because the colours seem to repeat (they are very close) and may appear meaningful while they are not. They were just helping with connecting the label and point correctly. 
+
+library(ggrepel)
+
+ggplot(umap_df, aes(x = umap_df[,1], y = umap_df[,2], label = rownames(umap_df))) + geom_point() + theme_classic() + theme(legend.position = "none") + geom_text_repel(cex = 2) +   labs(
+    title = "UMAP of dog and human cancer IC expression patterns",
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = "UMAP-1",
+    y = "UMAP-2",
+  )
+
+ggsave(filename = "./OUTPUT/UMAP_TPM_merged_standardized_t.png")
+
+```
+
+```{r}
+### Classic PCA for species comparison with base R AND DATA PREP FOR ADVANCED PCA LATER BELOW
+
+# You can't just load any data into PCA, because it is sensitive to outliers and is said to assume normal distribution, which is rarely the case for sequencing results. Hence the data needs to be normalized. Hence the log transformation, and then centering (and optional scaling) within the prcomp command.
+
+# Data
+comparing_nonstd <- as.data.frame(TPM_merged_t) 
+
+# Prepare data labels as either "human" or "canine"
+
+species_labels <- c(rep("canine", 14), rep("human", 27))
+cancer_labels <- gsub('.{8}$', '', rownames(comparing_nonstd))
+
+# Add a column of species and of cancer names without species since it has its own column already 
+# They will not go as input to PCA though
+
+comparing_nonstd <-cbind(Species=species_labels, comparing_nonstd)
+comparing_nonstd <-cbind(cancer=gsub('.{8}$', '', rownames(comparing_nonstd)), comparing_nonstd)
+
+# The log normalization as in:
+# https://www.biostars.org/p/210447/
+
+comparing_nonstd_logged <- log2(comparing_nonstd[,-c(1,2)] + 1)
+
+# recovering the label columns
+# comparing_nonstd_logged <- cbind(comparing_nonstd[,c(1,2)], comparing_nonstd_logged)
+
+# PCA calculation; "scale = TRUE" changes a lot - I see separation on PC2, and without it there is some slightly inferior separation on PC3. 
+pca <- prcomp(comparing_nonstd_logged, center = TRUE, scale = TRUE)
+
+# Basic plot with species coloured
+# ggplot(as.data.frame(pca$x), aes(PC1,PC2)) + geom_point(size = 8, aes(colour = species_labels)) 
+
+# Generate proportion of variability
+pcv <- round((pca$sdev)^2 / sum(pca$sdev^2)*100, 2)
+
+# Make a nice PCA plot; setting "max.overlaps = 20" or "=Inf" in geom_text_repel will show more labels
+# Based on: https://www.biostars.org/p/337160/
+
+ggplot(as.data.frame(pca$x), aes(PC1,PC2,colour = species_labels)) +
+               geom_point() +
+               xlab(label=paste0("PC1 (", pcv[1], "%)")) +
+               ylab(label=paste0("PC2 (", pcv[2], "%)")) +
+               theme_bw() + 
+                geom_text_repel(aes(label = cancer_labels), size = 2, show.legend = F) +
+               theme(axis.title.x = element_text(size=15),
+                     axis.title.y = element_text(size=15)) +
+               labs(title    = "My Basic PCA",
+                    subtitle = "Of TPM merged dataset",
+                    caption  = "Coloured by species")
+
+ggplot(as.data.frame(pca$x), aes(PC2,PC3,colour = species_labels)) +
+               geom_point() +
+               xlab(label=paste0("PC2 (", pcv[2], "%)")) +
+               ylab(label=paste0("PC3 (", pcv[3], "%)")) +
+               theme_bw() +
+               theme(axis.title.x = element_text(size=15),
+                     axis.title.y = element_text(size=15)) +
+               labs(title    = "My Basic PCA",
+                    subtitle = "Of TPM merged dataset",
+                    caption  = "Coloured by species")
+
+ggplot(as.data.frame(pca$x), aes(PC3,PC4,colour = species_labels)) +
+               geom_point() +
+               xlab(label=paste0("PC3 (", pcv[3], "%)")) +
+               ylab(label=paste0("PC4 (", pcv[4], "%)")) +
+               theme_bw() +
+               theme(axis.title.x = element_text(size=15),
+                     axis.title.y = element_text(size=15)) +
+               labs(title    = "My Basic PCA",
+                    subtitle = "Of TPM merged dataset",
+                    caption  = "Coloured by species")
+
+#Optional - reading the PCA parameters
+
+# Eigenvalues
+eig.val <- get_eigenvalue(pca)
+eig.val
+# Results for Variables
+res.var <- get_pca_var(pca)
+res.var$coord          # Coordinates
+res.var$contrib        # Contributions to the PCs
+res.var$cos2           # Quality of representation 
+# Results for individuals
+res.ind <- get_pca_ind(pca)
+res.ind$coord          # Coordinates
+res.ind$contrib        # Contributions to the PCs
+res.ind$cos2           # Quality of representation 
+
+```
+
+
+```{r}
+# Advanced PCA with PCAtools for a pretty figure - species-defining genes
+# https://bioconductor.org/packages/release/bioc/vignettes/PCAtools/inst/doc/PCAtools.html
+# https://www.bioconductor.org/packages/release/bioc/manuals/PCAtools/man/PCAtools.pdf
+# library(PCAtools)
+
+# Notice this time I need to transpose input for pca and hence also for metadata first
+# which I did not have to for normal PCA, the data was already transposed anyway, but oh well...
+
+#Preparing the metadata in a way expected by the PCAtools::pca
+
+metadata <- data.frame(row.names = colnames(t(comparing_nonstd_logged)))
+
+metadata$Species <- c(rep("canine", 14), rep("human", 27))
+
+metadata$Cancers <- gsub('.{8}$', '', rownames(comparing_nonstd_logged))
+
+#Running the actual PCA including the metadata, so that the metadata lands in the resulting object 
+
+pca2 <- PCAtools::pca(t(comparing_nonstd_logged), metadata = metadata, center = TRUE, scale = TRUE)
+
+#Assesing the -suggested- optimal number of PCs to retain and consider
+#A number of PCs that contributes to a pre-selected percentage total of explained variation, setting 80 means at least 80%
+
+horn <- parallelPCA(t(comparing_nonstd_logged))
+horn$n
+
+elbow <- findElbowPoint(pca2$variance)
+elbow
+
+pca_threshold <- which(cumsum(pca2$variance) > 80)[1]
+pca_threshold
+
+#Visualizing the suggested numbers on a Scree plot
+
+colour1 <- "chartreuse3"
+  
+colour2 <- "dodgerblue4"
+
+#Getting a palette of nice colours for the barplot bars
+
+colfunc <- colorRampPalette(c(colour1, "black"))
+colours10a <- colfunc(10)
+
+colfunc <- colorRampPalette(c(colour2, "black"))
+colours10b <- colfunc(10)
+
+#Screeplot
+
+screeplot(
+    pca2,
+    components = getComponents(pca2, 1:10),
+    vline = c(horn$n, elbow, pca_threshold),
+    hline = c(80),
+    colBar = colours10a,
+    colCumulativeSumLine = colours10b,
+    colCumulativeSumPoints = "black",
+    ) +
+    geom_label(aes(x = horn$n, y = 50,
+      label = 'Horn\'s method', vjust = -1, size = 10)) +
+    geom_label(aes(x = elbow , y = 60,
+      label = 'Elbow method', vjust = -1, size = 10)) +
+    geom_label(aes(x = pca_threshold, y = 80,
+      label = 'Threshold=80%', vjust = -1, size = 10))
+
+ggsave(
+  "./OUTPUT/scree_fig.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+#A plot of chosen PC combinations
+#margingaps - the margins between plots in the plot space
+#it takes ggplot modifications, and theme(aspect.ratio = 1) makes the stuff square (equal x and y dims)
+
+pairsplot(pca2,
+    components = getComponents(pca2, c(1:6)),
+    triangle = TRUE, trianglelabSize = 12,
+    hline = 0, vline = 0,
+    pointSize = 1,
+    gridlines.major = FALSE, gridlines.minor = FALSE,
+    colby = 'Species', 
+    colkey = c('canine' = colour1, 'human' = colour2),
+    title = '', plotaxes = FALSE,
+    margingaps = unit(c(-0.01, -0.01, -0.01, -0.01), 'cm'),
+    ) + theme(aspect.ratio = 1)
+
+ggsave(
+  "./OUTPUT/pair_fig.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+#A plot of loadings
+
+plotloadings(pca2, labSize = 3)
+
+#A table: the rotated data that represents the observations / samples (for the first 5)
+#replace [] with [1:5,1:5] to preview only first 5 PCs and features
+
+pca2$rotated[]
+
+#A table: the variable loadings are stored in loadings
+#replace [] with [1:5,1:5] to preview only first 5 PCs and features
+
+pca2$loadings[]
+
+
+#Biplot plus; don't ask me why both lab and colby cannot be directed to metadata in the same way
+
+PCAtools::biplot(pca2,
+            lab = pca2$metadata$Cancers,
+            colby = 'Species', colkey = c('canine' = colour1, 'human' = colour2),
+            encircle = TRUE,
+            encircleFill = TRUE,
+            hline = 0, vline = 0,
+            legendPosition = 'top') + theme(aspect.ratio = 1)
+
+ggsave(
+  "./OUTPUT/bi_fig.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+#Determine the variables that drive variation among each PC
+#https://bioconductor.org/packages/release/bioc/vignettes/PCAtools/inst/doc/PCAtools.html
+
+#If, on the bi-plot or pairs plot, we encounter evidence that 1 or more PCs are segregating a factor of interest, we can explore further the genes that are driving these differences along each PC. For each PC of interest, ‘plotloadings’ determines the variables falling within the top/bottom 5% of the loadings range, and then creates a final consensus list of these. These variables are then plotted. The loadings plot, like all others, is highly configurable. To modify the cut-off for inclusion / exclusion of variables, we use rangeRetain, where 0.01 equates to the top/bottom 1% of the loadings range per PC.
+
+plotloadings(pca2,
+    components = getComponents(pca2, c(1:3)),
+    rangeRetain = 0.05,
+    absolute = TRUE,
+    labSize = 4.0,
+    title = 'Absolute loadings plot',
+    ylab = "Absolute component loading",
+    axisLabSize = 16,
+    subtitle = 'PC 1-3',
+    caption = 'Top 5% variables',
+    shape = 21, 
+    shapeSizeRange = c(1, 16),
+    col = c("black", colour1),
+    drawConnectors = TRUE) + theme(aspect.ratio = 1)
+
+
+ggsave(
+  "./OUTPUT/load_fig.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+```
+
+
+```{r}
+###DISTANCE, HC AND DENDROGRAM WITH PCA-IDENTIFIED TOP SPECIES-DETERMINING GENES !!!REMOVED!!! for test.
+
+# library(amap)
+# library(factoextra)
+
+#A check of numbers - are these my genes of choice?
+
+colnames(TPM_merged_standardized_t[,c(20,24,37,39)])
+TPM_merged_standardized_t_excl <- TPM_merged_standardized_t[,-c(20,24,37,39)]
+
+#Pearson, standardized - just in case
+
+amap.dist.stand.pear_excl <- amap::Dist(TPM_merged_standardized_t_excl, method = "correlation")
+amap.dist.stand.pear.matrix_excl <- as.matrix(amap.dist.stand.pear_excl)
+
+png(file="./OUTPUT/amap-dist-stand-pear_TopGenesRemoved.png", width = 4450, height = 4000, res = 300)
+fviz_dist(amap.dist.stand.pear_excl)
+dev.off()
+
+write.csv(amap.dist.stand.pear.matrix_excl, file="./OUTPUT/amap-dist-stand-pear_TopGenesRemoved.csv",row.names=T)
+
+###Dendrogram
+
+#without as.dist you will get a table of data for some reason, that is not a full Dist class object
+
+clustering.matrix_excl <- as.dist(amap.dist.stand.pear.matrix_excl)
+
+hclust.output_excl <- hclust(clustering.matrix_excl, method = "ward.D2")
+
+dendrogram_colours <- "locuszoom"
+
+#Prepare the dendrogram
+
+#To have labels in the colours of the clusters change color_labels_by_k to false. Add "label_cols = dendrogram_labels_col" to distinguish human/dog by label colour too
+
+dendrogram_graph <- fviz_dend(x = hclust.output_excl, cex = 0.4, lwd = 0.4, type = "rectangle", horiz = TRUE, labels_track_height = 1, rect = TRUE, rect_fill = TRUE, lower_rect = -1.7, k_colors = dendrogram_colours, rect_border = dendrogram_colours, xlab = "Cancer type", ylab = "Distance", sub = "", main = "Similarity of median IC expression patterns between canine (bold) and human cancer types ", font.main = 7, k=14, color_labels_by_k = FALSE)
+
+
+#Save the dendrogram
+png(file="./OUTPUT/dendrogram_wardD2_TopGenesRemoved.png", res = 300, width = 1600, height = 1600)
+
+dendrogram_graph
+
+dev.off()
+
+```
+
+
+```{r}
+###DISTANCE, HC AND DENDROGRAM WITH 4 !!!RANDOM!!! GENES REMOVED for comparison
+
+# library(amap)
+# library(factoextra)
+
+#Preparing the distance matrix with the genes I want to remove: CD160, A2AR, NKG2A, OX40 
+#A check of numbers - are these my genes of choice?
+
+colnames(TPM_merged_standardized_t[,c(18, 23, 27, 41)])
+
+TPM_merged_standardized_t_excl <- TPM_merged_standardized_t[,-c(18, 23, 27, 41)]
+
+#Pearson, standardized - just in case
+
+amap.dist.stand.pear_excl <- amap::Dist(TPM_merged_standardized_t_excl, method = "correlation")
+amap.dist.stand.pear.matrix_excl <- as.matrix(amap.dist.stand.pear_excl)
+
+png(file="./OUTPUT/amap-dist-stand-pear_RandomGenesRemoved.png", width = 4450, height = 4000, res = 300)
+fviz_dist(amap.dist.stand.pear_excl)
+dev.off()
+
+write.csv(amap.dist.stand.pear.matrix_excl, file="./OUTPUT/amap-dist-stand-pear_RandomGenesRemoved.csv",row.names=T)
+
+###Dendrogram
+
+#without as.dist you will get a table of data for some reason, that is not a full Dist class object
+
+clustering.matrix_excl <- as.dist(amap.dist.stand.pear.matrix_excl)
+
+hclust.output_excl <- hclust(clustering.matrix_excl, method = "ward.D2")
+
+dendrogram_colours <- "locuszoom"
+
+#Prepare the dendrogram
+
+#To have labels in the colours of the clusters change color_labels_by_k to false. Add "label_cols = dendrogram_labels_col" to distinguish human/dog by label colour too
+
+dendrogram_graph <- fviz_dend(x = hclust.output_excl, cex = 0.4, lwd = 0.4, type = "rectangle", horiz = TRUE, labels_track_height = 1, rect = TRUE, rect_fill = TRUE, lower_rect = -1.7, k_colors = dendrogram_colours, rect_border = dendrogram_colours, xlab = "Cancer type", ylab = "Distance", sub = "", main = "Similarity of median IC expression patterns between canine (bold) and human cancer types ", font.main = 7, k=14, color_labels_by_k = FALSE)
+
+
+#Save the dendrogram
+png(file="./OUTPUT/dendrogram_wardD2_RandomGenesRemoved.png", res = 300, width = 1600, height = 1600)
+
+dendrogram_graph
+
+dev.off()
+```
+
+
+```{r}
+###DISTANCE, HC AND DENDROGRAM WITH PCA-IDENTIFIED TOP 4 SPECIES-DETERMINING GENES ONLY!!!
+
+# library(amap)
+# library(factoextra)
+
+#Preparing the distance matrix with the genes I want to remove: CD160, A2AR, NKG2A, OX40 
+#A check of numbers - are these my genes of choice?
+
+colnames(TPM_merged_standardized_t[,c(20,24,37,39)])
+
+TPM_merged_standardized_t_excl <- TPM_merged_standardized_t[,c(20,24,37,39)]
+
+# DISTANCE - Pearson, standardized - just in case
+
+amap.dist.stand.pear_excl <- amap::Dist(TPM_merged_standardized_t_excl, method = "correlation")
+amap.dist.stand.pear.matrix_excl <- as.matrix(amap.dist.stand.pear_excl)
+
+png(file="./OUTPUT/amap-dist-stand-pear_OnlyTopGenesIncluded.png", width = 4450, height = 4000, res = 300)
+fviz_dist(amap.dist.stand.pear_excl)
+dev.off()
+
+write.csv(amap.dist.stand.pear.matrix_excl, file="./OUTPUT/amap-dist-stand-pear_OnlyTopGenesIncluded.csv",row.names=T)
+
+### CLUSTERING like before
+
+#without as.dist you will get a table of data for some reason, that is not a full Dist class object
+
+clustering.matrix_excl <- as.dist(amap.dist.stand.pear.matrix_excl)
+
+hclust.output_excl <- hclust(clustering.matrix_excl, method = "ward.D2")
+
+#Prepare the Dendrogram
+
+labels_colours <- c(colour1, rep(colour2, 26), rep(colour1, 2), colour2, rep(colour1, 11))
+
+dendrogram_colours <- c(colour2, colour1)
+
+#To have labels in the colours of the clusters change color_labels_by_k to TRUE. 
+
+dendrogram_graph <- fviz_dend(x = hclust.output_excl, cex = 0.5, lwd = 0.5, type = "rectangle", horiz = TRUE, rect = FALSE, rect_fill = FALSE, lower_rect = -7, labels_track_height = 7, k_colors = dendrogram_colours, rect_border = "black", xlab = "Cancer type", ylab = "Distance", sub = "", main = "Canine-human patterns similarity based on the top 4 species defining genes from PCA", font.main = 7, k=2, color_labels_by_k = FALSE, label_cols = labels_colours)
+
+#Save the dendrogram
+png(file="./OUTPUT/dendrogram_wardD2_OnlyTopGenesIncluded.png", res = 300, width = 1600, height = 1600)
+
+dendrogram_fonts <- c(2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,1,2,2,2,2,2,2,2,2,2,2,2)
+
+dendrogram_graph$layers[[2]]$aes_params$fontface <- dendrogram_fonts
+
+dendrogram_graph
+
+dev.off()
+```
+
+
+```{r}
+###DISTANCE, HC AND DENDROGRAM WITh 4 RANDOM GENES! - for comparison
+
+# library(amap)
+# library(factoextra)
+
+#A check of numbers - are these my genes of choice?
+
+colnames(TPM_merged_standardized_t[,c(18, 23, 27, 41)])
+
+TPM_merged_standardized_t_rando <- TPM_merged_standardized_t[,c(18, 23, 27, 41)]
+
+# DISTANCE - Pearson, standardized - just in case
+
+amap.dist.stand.pear_rando <- amap::Dist(TPM_merged_standardized_t_rando, method = "correlation")
+amap.dist.stand.pear.matrix_rando <- as.matrix(amap.dist.stand.pear_rando)
+
+png(file="./OUTPUT/amap-dist-stand-pear_Only4Randomd.png", width = 4450, height = 4000, res = 300)
+fviz_dist(amap.dist.stand.pear_rando)
+dev.off()
+
+write.csv(amap.dist.stand.pear.matrix_rando, file="./OUTPUT/amap-dist-stand-pear_Only4Random.csv",row.names=T)
+
+### CLUSTERING like before
+
+#without as.dist you will get a table of data for some reason, that is not a full Dist class object
+
+clustering.matrix_rando <- as.dist(amap.dist.stand.pear.matrix_rando)
+
+hclust.output_rando <- hclust(clustering.matrix_rando, method = "ward.D2")
+
+#Prepare the Dendrogram
+
+#labels_colours <- c(colour1, rep(colour2, 26), rep(colour1, 2), colour2, rep(colour1, 11))
+
+dendrogram_colours <- "black"
+
+labels_colours  <- c(colour1, colour2, colour2, colour1, colour2, colour2, colour2, colour2, colour2, colour2, colour1, colour2, colour2, colour2, colour2, colour1, colour2, colour2, colour1, colour2, colour2, colour2, colour2, colour1, colour2, colour2, colour2, colour1, colour2, colour1, colour2, colour1, colour1, colour2, colour2, colour1, colour2, colour1, colour1, colour1, colour2)
+
+#To have labels in the colours of the clusters change color_labels_by_k to TRUE. 
+
+dendrogram_graph <- fviz_dend(x = hclust.output_rando, cex = 0.5, lwd = 0.5, type = "rectangle", horiz = TRUE, rect = FALSE, rect_fill = FALSE, lower_rect = -7, labels_track_height = 7, k_colors = dendrogram_colours, rect_border = "black", xlab = "Cancer type", ylab = "Distance", sub = "", main = "Canine-human patterns similarity based on 4 random IC genes", font.main = 7, k=2, color_labels_by_k = FALSE, label_cols = labels_colours)
+
+#Save the dendrogram
+png(file="./OUTPUT/dendrogram_wardD2_Only4Random.png", res = 300, width = 1600, height = 1600)
+
+#dendrogram_fonts <- c(2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,1,2,2,2,2,2,2,2,2,2,2,2)
+
+#dendrogram_graph$layers[[2]]$aes_params$fontface <- dendrogram_fonts
+
+dendrogram_graph
+
+dev.off()
+```
+
+
+```{r}
+#INDIVIDUALS UMAP ANALYSIS!!!
+
+#DOG INDIVIDUAL TPM IMPORT from my samples
+
+#Importing TPMs imported already by tximport, so I don't have to work on files again.
+TPM_Table <- txi$abundance
+
+#Collapsing reps like before
+#now we are just using "sample_reps" as defined much earlier, to make sure it is the up to date version.
+#Add the replicate row to the data
+
+TPM_Table_rep <- rbind(sample_reps, TPM_Table)
+
+#Save for control
+write.csv(TPM_Table_rep,file="./OUTPUT/TPM_Table_rep.csv",row.names=T)
+
+#Need to add the conditions, will do it based on replicate numbers, as adding them to the original DF does not let me run aggregate...
+
+#Transposing cause R can only gather by row not column...
+
+TPM_Table_rep_t <- t(TPM_Table_rep)
+
+##Collapsing replicates - works fine, checked:
+TPM_Table_rep_t_agg <- aggregate(TPM_Table_rep_t[,-1], by=list(Rep_num=TPM_Table_rep_t[, 1]), FUN=sum)
+
+#Check the sizes before and after collapsing "replicates"
+dim(TPM_Table_rep_t)
+dim(TPM_Table_rep_t_agg)
+
+#Adding back the condition type to the aggregated data frame, but unlike "condition", it has the number of cancer types AFTER the aggregation, so less OSs and UCs. Make sure that the order and names of cancers are updated if the original conditions are changed in the script beginning - but keep the right sample number below:
+
+condition_TPM = factor(c(rep("ameloblastoma", 11), rep("B-cell lymphoma", 12), rep("mammary cancers", 158), rep("glioma", 42), rep("hemangiosarcoma", 45), rep("hemangiosarcoma", 8), rep("insulinoma", 6), rep("melanoma", 12), rep("meningioma", 13), rep("osteosarcoma", 31), rep("oral squamous cell carcinoma", 10), rep("prostate carcinoma", 11), rep("lung carcinoma", 12), rep("T-cell lymphoma", 12), rep("T-cell lymphoma", 6), rep("urothelial carcinoma", 29)))
+
+#checking if the number is right - needs to be the same as the number of "files"
+length(condition_TPM)
+dim(TPM_Table_rep_t_agg)
+
+#Replacing the replicate row with cancer type name; if it causes problems, use numbers, not names, for now, as cancer IDs until data is processed into median
+
+TPM_Table2 <- cbind(condition_TPM, TPM_Table_rep_t_agg[, -1])
+
+#Instead of aggregate:
+
+colnames(TPM_Table2)[1] <- "Condition"
+
+#Keeping the rows of interest
+
+selected3 <- c("ENSCAFG00000013184", "ENSCAFG00000002120", "ENSCAFG00000002121", "ENSCAFG00000023455", "ENSCAFG00000018641","ENSCAFG00000014675", "ENSCAFG00000032313", "ENSCAFG00000012876", "ENSCAFG00000012872", "ENSCAFG00000010997", "ENSCAFG00000011751", "ENSCAFG00000010817", "ENSCAFG00000012722", "ENSCAFG00000004666", "ENSCAFG00000025524", "ENSCAFG00000009887", "ENSCAFG00000014498", "ENSCAFG00000014354", "ENSCAFG00000009858", "ENSCAFG00000013828", "ENSCAFG00000013933", "ENSCAFG00000012880", "ENSCAFG00000010718", "ENSCAFG00000019328", "ENSCAFG00000057149", "ENSCAFG00000019673", "ENSCAFG00000030400", "ENSCAFG00000009994", "ENSCAFG00000018945", "ENSCAFG00000015149", "ENSCAFG00000030308", "ENSCAFG00000000038", "ENSCAFG00000019329", "ENSCAFG00000014590", "ENSCAFG00000019422", "ENSCAFG00000018627", "ENSCAFG00000055618", "ENSCAFG00000010480", "ENSCAFG00000028587", "ENSCAFG00000017820", "ENSCAFG00000010358", "ENSCAFG00000012598", "ENSCAFG00000000386", "ENSCAFG00000005750")
+
+names3 <- c("PD-1", "PD-L1", "PD-L2", "TIM-3", "GAL-9", "LAG-3", "FGL-1", "CTLA-4", "CD28", "CD80", "CD86", "TIGIT", "NECTIN4", "CD155", "SIRPA", "CD47", "PVRIG", "VISTA", "B7-H4", "A2AR", "NOX2", "ICOS", "ICOSLG", "OX40", "OX40L", "4-1BB", "4-1BBL", "CD40", "CD40L", "CD27", "CD70", "CD226", "GITR", "GITRL", "HVEM", "LIGHT", "CD160", "BTLA", "NKG2A", "B7-H3", "TACTILE", "SLAMF7", "Arginase 1", "IDO")
+
+#keep the column with cancer type
+stay <- c("Condition", selected3)
+
+TPM_Dog <- TPM_Table2[,stay]
+
+# modifying canine names like for human:
+
+TPM_Dog[,1] <- paste(TPM_Dog[,1],"(canine)",sep=" ")
+
+```
+
+```{r}
+#Human individual import
+
+# EBI fails since days when I want to display all patients for my genes, so I need to download and select the data a bit like with dog earlier... First I download the whole dataset for this large study. R struggles with TPM_Human <- readr::read_tsv(file = "./INPUT/E-MTAB-5423.tsv", col_names = FALSE), so I need to preprocess the tsv file in Excel and save as csv:
+#Remove top # rows with some info
+#Remove columns with normal samples by find/”normal” and delete/columns
+#Shorten column names by replace “,*” with nothing.
+#Save as CSV…
+
+#check.names=FALSE lets it import the column names as they are originally, without it the spaces and dashes are converted to dots
+
+TPM_Human <- read.csv(file = "./INPUT/E-MTAB-5423-processed.csv", sep = ";", check.names=FALSE)
+
+colnames(TPM_Human)[-c(1,2)] <- paste(colnames(TPM_Human)[-c(1,2)],"(human)",sep=" ")
+
+#Correcting an ugly random name of the first column
+colnames(TPM_Human)[1] <- "IC"
+
+#Keeping the rows of interest
+
+selected3 <- c("ENSG00000188389", "ENSG00000120217", "ENSG00000197646", "ENSG00000135077", "ENSG00000168961", "ENSG00000089692", "ENSG00000104760", "ENSG00000163599", "ENSG00000178562", "ENSG00000121594", "ENSG00000114013", "ENSG00000181847", "ENSG00000143217", "ENSG00000073008", "ENSG00000198053", "ENSG00000196776", "ENSG00000213413", "ENSG00000107738", "ENSG00000134258", "ENSG00000128271", "ENSG00000165168", "ENSG00000163600", "ENSG00000160223", "ENSG00000186827", "ENSG00000117586", "ENSG00000049249", "ENSG00000125657", "ENSG00000101017", "ENSG00000102245", "ENSG00000139193", "ENSG00000125726", "ENSG00000150637", "ENSG00000186891", "ENSG00000120337", "ENSG00000157873", "ENSG00000125735", "ENSG00000117281", "ENSG00000186265", "ENSG00000134545", "ENSG00000103855", "ENSG00000153283", "ENSG00000026751", "ENSG00000118520", "ENSG00000131203")
+
+names3 <- c("PD-1", "PD-L1", "PD-L2", "TIM-3", "GAL-9", "LAG-3", "FGL-1", "CTLA-4", "CD28", "CD80", "CD86", "TIGIT", "NECTIN4", "CD155", "SIRPA", "CD47", "PVRIG", "VISTA", "B7-H4", "A2AR", "NOX2", "ICOS", "ICOSLG", "OX40", "OX40L", "4-1BB", "4-1BBL", "CD40", "CD40L", "CD27", "CD70", "CD226", "GITR", "GITRL", "HVEM", "LIGHT", "CD160", "BTLA", "NKG2A", "B7-H3", "TACTILE", "SLAMF7", "Arginase 1", "IDO")
+
+#keep the rows with genes of interest
+
+rownames(TPM_Human) <- TPM_Human[,1]
+
+TPM_Human2 <- TPM_Human[selected3,]
+
+#Add my gene names before I remove their names so I can still check alignement
+
+rownames(TPM_Human2) <- names3
+
+#Replace NAs with 0
+
+TPM_Human2[is.na(TPM_Human2)] <- 0
+
+#Now how the can one subset columns so that R does not rename my colnames by adding .number?!
+
+TPM_Human3 <- TPM_Human2[,-c(1:2)]
+
+# I just re-add the old names without the names of the removed columns
+
+colnames(TPM_Human3) <- colnames(TPM_Human2)[-c(1:2)]
+
+#Changing the ENSCAFG names od DOG to human readable names like in the Human TPM table
+
+TPM_Dog_prep <- TPM_Dog
+
+colnames(TPM_Dog_prep)[-1] <- names2
+
+#Transposing this one so that I can standardize both tables, and standardization happens for columns
+
+TPM_Dog_prep <- t(TPM_Dog_prep)
+
+#Getting both matrices to have rownames and colnames and only numbers in the data
+
+colnames(TPM_Dog_prep) <- TPM_Dog_prep[1,]
+
+TPM_Dog_prep <- TPM_Dog_prep[-1, ]
+
+#Merging the tables
+
+TPM_merged <- cbind(TPM_Dog_prep, TPM_Human3)
+
+#Transposing the tables again, because the distance matrix functions usually calculate distances between rows, so I need cancer types to be rows.
+
+TPM_merged_t <- t(TPM_merged)
+
+#And ofc now rownames are broken si I need to fix it. I think R can't accept multiple identical names of rows or columns when processing a df. I add a column with the proper cancer names to use later.
+
+TPM_merged_t <- cbind(colnames(TPM_merged), TPM_merged_t)
+```
+
+```{r}
+###UMAP of INDIVIDUAL merged data
+
+library(umap)
+
+#not standardized data for now
+#Preparing the data, otherwise there is a "character" problem...
+
+DogHuman.data <- as.data.frame(TPM_merged_t)
+
+DogHuman.data[2:45] <- sapply(DogHuman.data[2:45],as.numeric)
+
+DogHuman.labels <- TPM_merged_t[,1]
+
+DogHuman.species <- c(rep("canine", 418), rep("human", 1200))
+
+#operation
+
+DogHuman.umap <- umap(t(scale(t(DogHuman.data[,-1]))))
+
+#umap plot
+
+plot(DogHuman.umap$layout) 
+```
+
+
+```{r}
+#UMAP PLOT OF INDIVIDUALS BY SPECIES
+
+#umap_df <- as.data.frame(cbind(DogHuman.umap$layout, DogHuman.labels))
+
+umap_df <- as.data.frame(DogHuman.umap$layout)
+
+library(ggrepel)
+
+#hjust and vjust explained: https://stackoverflow.com/questions/7263849/what-do-hjust-and-vjust-do-when-making-a-plot-using-ggplot
+
+#Colours
+colour1 <- "chartreuse3"
+colour2 <- "dodgerblue4"
+
+ggplot(umap_df, 
+       aes(x = umap_df[,1], y = umap_df[,2], color = DogHuman.species)) + 
+  geom_point(size = 1, alpha = 0.3) + 
+  theme_classic() + 
+  theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=16)) + 
+  labs(
+    title = "",
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = "UMAP-1",
+    y = "UMAP-2",
+  ) + scale_color_manual(values = c("canine" = colour1, "human" = colour2)) +
+  theme(aspect.ratio = 0.5) +
+   guides(color = guide_legend(override.aes = list(size=8)))
+
+ggsave(
+  "./OUTPUT/UMAP_INDIVIDUAL_TPM_merged_t.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 24,
+  height = 14,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+```
+
+```{r}
+#FOLLOWUP: VISUALIZING UMAP FOR ALL CANCERS SEPARATELY
+
+# R cannot pass an argument to scale_color_manual but when I put it there directly it works. I had to use setNames to achieve this, like here: https://stackoverflow.com/questions/71240928/why-cant-i-use-vector-in-scale-fill-manual
+
+#I remove this below to have naked plots to be combined on one page:
+
+gg_function_UMAP <- function(cancer) {
+
+  ggplot(umap_df, aes(x = umap_df[,1], y = umap_df[,2], color = DogHuman.labels)) + 
+  geom_point(size = 1, alpha = 0.7) + 
+  theme_classic() + 
+  theme(legend.position = "NULL", legend.title = element_blank(), legend.text = element_text(size=8)) + 
+  labs(
+    title = cancer,
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = "",
+    y = "",
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=8))) +
+   scale_color_manual(values = setNames(c("red"), c(cancer)))
+  
+  ggsave(
+  paste("./OUTPUT/UMAP_INDIVIDUAL - ", cancer, ".png", sep = ""),
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 24,
+  height = 14,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+  
+}
+
+for (n in unique(DogHuman.labels)) {gg_function_UMAP(n)}
+```
+
+
+```{r}
+# MODIFIED UMAP PLOT OF 1-2 CANCERs IN INDIVIDUALS, with alpha higher for the chosen group
+
+# Some of the code explained here:
+# https://stackoverflow.com/questions/18394391/custom-legend-for-multiple-layer-ggplot
+
+gg_function_UMAP_alpha <- function(cancer1, cancer2, col1, col2, label1, label2, pointsalpha) {
+
+# Preparing a small df with only the rows for cancer of interest
+
+UMAP_choice1 <- cbind(umap_df, DogHuman.labels)
+UMAP_choice1 <- UMAP_choice1[UMAP_choice1[,3] == cancer1,]
+
+UMAP_choice2 <- cbind(umap_df, DogHuman.labels)
+UMAP_choice2 <- UMAP_choice2[UMAP_choice2[,3] == cancer2,]
+
+# GGplot with a separate geom for the chosen points
+
+  ggplot(umap_df, aes(x = umap_df[,1], y = umap_df[,2])) + 
+  geom_point(size = 1, alpha = 0.2, color = "grey") + 
+  geom_point(data = UMAP_choice1, size = 1, alpha = pointsalpha, aes(x = UMAP_choice1[,1], y = UMAP_choice1[,2], color = cancer1)) +
+  geom_point(data = UMAP_choice2, size = 1, alpha = pointsalpha, aes(x = UMAP_choice2[,1], y = UMAP_choice2[,2], color = cancer2)) +
+  theme_classic() + 
+  theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=16)) + 
+  labs(
+    title = "",
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = label1,
+    y = label2,
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=8))) +
+  scale_colour_manual(values = setNames(c(col1, col2), c(cancer1, cancer2)))
+  
+  ggsave(
+  paste("./OUTPUT/UMAP_INDIVIDUAL_ALPHA - ", cancer1, "_", cancer2, ".png", sep = ""),
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 24,
+  height = 14,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+  )
+  
+}
+
+# Code to generate plots for chosen pairs
+
+# Colours
+colour1 <- "chartreuse3"
+colour2 <- "dodgerblue4"
+
+gg_function_UMAP_alpha("glioma (canine)", "glioma (human)", colour1, colour2, "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha("osteosarcoma (canine)", "sarcoma (human)", "black", "red", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha("prostate carcinoma (canine)", "prostate adenocarcinoma (human)", "black",  "red", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha("NULL", "cholangiocarcinoma (human)", "NULL", "red", "UMAP-1", "UMAP-2", 0.6)
+
+
+# Code to generate a single plot for each cancer type
+
+for (n in unique(DogHuman.labels)) {gg_function_UMAP_alpha(n, "NULL", "red", "NULL", "", "", 0.5)}
+```
+
+
+```{r}
+#BRAIN CANCERS CUSTOM MULTIPLOT OF UMAP
+
+gg_function_UMAP_alpha_BRAINS <- function(cancer1, cancer2, cancer3, cancer4, col1, col2, col3, col4, label1, label2, pointsalpha) {
+
+#Preparing a small df with only the rows for cancer of interest
+
+UMAP_choice1 <- cbind(umap_df, DogHuman.labels)
+UMAP_choice1 <- UMAP_choice1[UMAP_choice1[,3] == cancer1,]
+
+UMAP_choice2 <- cbind(umap_df, DogHuman.labels)
+UMAP_choice2 <- UMAP_choice2[UMAP_choice2[,3] == cancer2,]
+
+UMAP_choice3 <- cbind(umap_df, DogHuman.labels)
+UMAP_choice3 <- UMAP_choice3[UMAP_choice3[,3] == cancer3,]
+
+UMAP_choice4 <- cbind(umap_df, DogHuman.labels)
+UMAP_choice4 <- UMAP_choice4[UMAP_choice4[,3] == cancer4,]
+
+#GGplot with a separate geom for the chosen points
+
+  ggplot(umap_df, aes(x = umap_df[,1], y = umap_df[,2])) + 
+  geom_point(size = 1, alpha = 0.2, color = "grey") + 
+  geom_point(data = UMAP_choice1, size = 1, alpha = pointsalpha, aes(x = UMAP_choice1[,1], y = UMAP_choice1[,2], color = cancer1)) +
+  geom_point(data = UMAP_choice2, size = 1, alpha = pointsalpha, aes(x = UMAP_choice2[,1], y = UMAP_choice2[,2], color = cancer2)) +
+  geom_point(data = UMAP_choice3, size = 1, alpha = pointsalpha, aes(x = UMAP_choice3[,1], y = UMAP_choice3[,2], color = cancer3)) +
+  geom_point(data = UMAP_choice4, size = 1, alpha = pointsalpha, aes(x = UMAP_choice4[,1], y = UMAP_choice4[,2], color = cancer4)) +
+  theme_classic() + 
+  theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=10)) + 
+  labs(
+    title = "",
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = label1,
+    y = label2,
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=8))) +
+  scale_colour_manual(values = setNames(c(col1, col2, col3, col4), c(cancer1, cancer2, cancer3, cancer4)), breaks=c(cancer1, cancer2, cancer3, cancer4))
+
+#The breaks argument above in scale_colour_manual allows me to put the cancers on the legend in the defined order, otherwise they are 
+#sorted alphabetically by R, which in this case is confusing when trying to interpret the plot.
+  
+  ggsave(
+  "./OUTPUT/UMAP_INDIVIDUAL_BRAINS.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 24,
+  height = 14,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+  )
+  
+}
+
+#colours for brain cancers, from Viridis palette, manually chosen
+
+colour4 <- "#440154"
+colour3 <- "#3b528b"
+colour2 <- "#21918c"
+colour1 <- "#5ec962"
+
+gg_function_UMAP_alpha_BRAINS("glioma (canine)", "meningioma (canine)", "glioma (human)", "glioblastoma multiforme (human)", colour1, colour2, colour3, colour4, "UMAP-1", "UMAP-2", 0.6)
+```
+
+```{r}
+#SARCOMAS CUSTOM MULTIPLOT OF UMAP
+
+gg_function_UMAP_alpha_BRAINS <- function(cancer1, cancer2, cancer3, col1, col2, col3, label1, label2, pointsalpha) {
+
+#Preparing a small df with only the rows for cancer of interest
+
+UMAP_choice1 <- cbind(umap_df, DogHuman.labels)
+UMAP_choice1 <- UMAP_choice1[UMAP_choice1[,3] == cancer1,]
+
+UMAP_choice2 <- cbind(umap_df, DogHuman.labels)
+UMAP_choice2 <- UMAP_choice2[UMAP_choice2[,3] == cancer2,]
+
+UMAP_choice3 <- cbind(umap_df, DogHuman.labels)
+UMAP_choice3 <- UMAP_choice3[UMAP_choice3[,3] == cancer3,]
+
+#GGplot with a separate geom for the chosen points
+
+  ggplot(umap_df, aes(x = umap_df[,1], y = umap_df[,2])) + 
+  geom_point(size = 1, alpha = 0.2, color = "grey") + 
+  geom_point(data = UMAP_choice1, size = 1, alpha = pointsalpha, aes(x = UMAP_choice1[,1], y = UMAP_choice1[,2], color = cancer1)) +
+  geom_point(data = UMAP_choice2, size = 1, alpha = pointsalpha, aes(x = UMAP_choice2[,1], y = UMAP_choice2[,2], color = cancer2)) +
+  geom_point(data = UMAP_choice3, size = 1, alpha = pointsalpha, aes(x = UMAP_choice3[,1], y = UMAP_choice3[,2], color = cancer3)) +
+  theme_classic() + 
+  theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=10)) + 
+  labs(
+    title = "",
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = label1,
+    y = label2,
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=8))) +
+  scale_colour_manual(values = setNames(c(col1, col2, col3), c(cancer1, cancer2, cancer3)), breaks=c(cancer2, cancer1, cancer3))
+
+#The breaks argument above in scale_colour_manual allows me to put the cancers on the legend in the defined order, otherwise they are 
+#sorted alphabetically by R, which in this case is confusing when trying to interpret the plot.
+  
+  ggsave(
+  "./OUTPUT/UMAP_INDIVIDUAL_SARCOMAS.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 24,
+  height = 14,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+  )
+  
+}
+
+#colours for brain cancers, from Viridis palette, manually chosen
+
+colour4 <- "#440154"
+colour3 <- "#3b528b"
+colour2 <- "#21918c"
+colour1 <- "#5ec962"
+
+gg_function_UMAP_alpha_BRAINS("osteosarcoma (canine)", "hemangiosarcoma (canine)", "sarcoma (human)", colour1, colour2, colour4, "UMAP-1", "UMAP-2", 0.6)
+```
+
+
+```{r}
+#OPTIONAL: UMAP MULTI-CANCER PLOTS
+
+#Muted palette, colourblind-friendly, from:
+#https://cran.r-project.org/web/packages/khroma/vignettes/tol.html#vibrant
+
+#colour3 <- "#CC6677"
+#colour4 <- "#332288"
+#colour5 <- "#DDCC77"
+#colour6 <- "#117733"
+#colour7 <- "#88CCEE"
+#colour8 <- "#882255"
+#colour9 <- "#44AA99"
+#colour10 <- "#999933"
+#colour11 <- "#AA4499"
+
+#I find that on such a plot it is hard to have more than 6 data types with different colours and distinguish between them well
+
+colour3 <- "red"
+colour4 <- "green"
+colour5 <- "blue"
+colour6 <- "magenta"
+colour7 <- "orange"
+colour8 <- "green4"
+
+colour9 <- "black"
+colour10 <- "black"
+colour11 <- "black"
+
+gg_function_UMAP_multi <- function(set_name, cancer1, cancer2, cancer3, cancer4, cancer5, cancer6, cancer7, cancer8, cancer9) {
+
+  ggplot(umap_df, aes(x = umap_df[,1], y = umap_df[,2], color = DogHuman.labels)) + 
+  geom_point(size = 1, alpha = 0.2) + 
+  theme_classic() + 
+  theme(legend.position = "right", legend.text = element_text(size=8)) + 
+  labs(
+    title = "UMAP of individual IC expression patterns in d/h",
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = "UMAP-1",
+    y = "UMAP-2",
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=4))) +
+   scale_color_manual(values = setNames(c(colour3, colour4, colour5, colour6, colour7, colour8, colour9, colour10, colour11), c(cancer1, cancer2, cancer3, cancer4, cancer5, cancer6, cancer7, cancer8, cancer9)))
+  
+  ggsave(
+  paste("./OUTPUT/UMAP_MULTI - ", set_name, ".png", sep = ""),
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 30,
+  height = 15,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+  
+}
+
+#To obtain a list of conditions and divide them into different groups:
+#unique(DogHuman.labels)
+
+gg_function_UMAP_multi("brain cancers", "glioma (canine)", "meningioma (canine)", "glioma (human)", "glioblastoma multiforme (human)", "NULL", "NULL", "NULL", "NULL", "NULL")
+
+gg_function_UMAP_multi("lymphatic cancers", "lymphoma (human)", "chronic lymphocytic leukemia (human)", "B-cell non-Hodgkin lymphoma (human)", "B-cell lymphoma (canine)", "T-cell lymphoma (canine)", "NULL", "NULL", "NULL", "NULL")
+
+gg_function_UMAP_multi("sarcomas", "sarcoma (human)", "osteosarcoma (canine)", "hemangiosarcoma (canine)",  "NULL", "NULL", "NULL", "NULL",  "NULL", "NULL")
+
+gg_function_UMAP_multi("gastrointestinal", "colorectal adenocarcinoma (human)", "esophageal adenocarcinoma (human)", "gastric adenocarcinoma (human)", "pancreatic adenocarcinoma (human)", "insulinoma (canine)",  "NULL", "NULL", "NULL", "NULL")
+
+gg_function_UMAP_multi("similars", "squamous cell lung carcinoma (human)", "lung carcinoma (canine)", "lung adenocarcinoma (human)", "melanoma (human)", "melanoma (canine)", "NULL", "NULL", "NULL", "NULL")
+
+gg_function_UMAP_multi("mammary cancers", "mammary cancers (canine)", "breast adenocarcinoma (human)", "invasive lobular carcinoma (human)", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL")
+
+gg_function_UMAP_multi("other sex-specific", "prostate carcinoma (canine)", "prostate adenocarcinoma (human)", "cervical adenocarcinoma (human)", "cervical squamous cell carcinoma (human)", "ovarian adenocarcinoma (human)", "endometrial adenocarcinoma (human)", "NULL", "NULL", "NULL")
+
+gg_function_UMAP_multi("urothelial and SCC", "bladder transitional cell carcinoma (human)", "urothelial carcinoma (canine)", "oral squamous cell carcinoma (canine)", "head and neck squamous cell carcinoma (human)", "NULL", "NULL", "NULL", "NULL", "NULL")
+
+gg_function_UMAP_multi("other", "ameloblastoma (canine)", "cholangiocarcinoma (human)", "chromophobe renal cell carcinoma (human)", "follicular thyroid carcinoma (human)", "hepatocellular carcinoma (human)", "renal cell carcinoma (human)", "NULL", "NULL", "NULL")
+
+```
+
+
+```{r}
+# PCA analysis that duplicates UMAP as there are some concerns over the interpretability of distances on UMAP
+
+# a plot per cancer like above.
+
+DogHuman.pca <- prcomp(t(scale(t(DogHuman.data[,-1]))), center = FALSE, scale = FALSE)
+
+DogHuman.pca_2 <- log2(DogHuman.data[,-1] + 1)
+DogHuman.pca_3 <- prcomp(DogHuman.pca_2, center = TRUE, scale = TRUE)
+
+# chosen
+
+ggplot(as.data.frame(DogHuman.pca$x), aes(PC1,PC2, colour = DogHuman.species)) +
+               geom_point() +
+               theme_bw() + 
+               theme(axis.title.x = element_text(size=15),
+                     axis.title.y = element_text(size=15)) +
+               labs(title    = "PCA of individuals",
+                    subtitle = "transpose scaling",
+                    caption  = "Coloured by species")
+
+# Chosen - more separating; FYI skipping PCA scaling for this one leads to a poorly readable chunk of coulours, bad separation
+
+ggplot(as.data.frame(DogHuman.pca_3$x), aes(PC1,PC2, colour = DogHuman.species)) +
+               geom_point() +
+               theme_bw() + 
+               theme(axis.title.x = element_text(size=15),
+                     axis.title.y = element_text(size=15)) +
+               labs(title    = "PCA of individuals",
+                    subtitle = "log normalized and pca scaling",
+                    caption  = "Coloured by species")
+
+#testing custom colouring
+
+test_frame <- as.data.frame(DogHuman.pca_3$x)
+
+my_colors <- c("chartreuse3", "dodgerblue4")
+
+
+  ggplot(test_frame$x, aes(x = test_frame[,1], y = test_frame[,2],  colour = DogHuman.species)) + 
+  geom_point(size = 1, alpha = 0.5) + 
+  theme_classic() + 
+  theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=16)) + 
+  labs(
+    title = "",
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = "",
+    y = "",
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=8))) +
+  scale_colour_manual(values = my_colors)
+  
+# Decided to go for log-normalized version for the paper, it say matches the other PCA representation of the data in the paper 
+```
+
+```{r}
+#PCA plot of dog/human in scaled and log-normalized versions for comparison with cancer data - with right colours added
+
+my_colors <- c("chartreuse3", "dodgerblue4")
+
+#Copying the names for DFs from code I made later below
+
+pca_df_transpose_scaled <- as.data.frame(DogHuman.pca$x[,c(1,2)])
+pca_df_log_normalized <- as.data.frame(DogHuman.pca_3$x[,c(1,2)])
+
+#Also using the column names - PC1 and PC2 - now, for simplicity
+
+#SCALED
+
+ggplot(pca_df_transpose_scaled, aes(x = PC1, y = PC2,  colour = DogHuman.species)) + 
+  geom_point(size = 1, alpha = 0.5) + 
+  theme_classic() + 
+  theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=16)) + 
+  labs(
+    title = "",
+    subtitle = "transpose-scaled",
+    caption = "",
+    tag = "",
+    x = "PC1",
+    y = "PC2",
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=8))) +
+  scale_colour_manual(values = my_colors)
+
+  ggsave(
+  paste("./OUTPUT/PCA_INDIVIDUAL_ALPHA - ", "species", "_", "transpose_scaled", ".png", sep = ""),
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 24,
+  height = 14,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+  
+#LOGGED
+
+ggplot(pca_df_log_normalized, aes(x = PC1, y = PC2,  colour = DogHuman.species)) + 
+  geom_point(size = 1, alpha = 0.5) + 
+  theme_classic() + 
+  theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=16)) + 
+  labs(
+    title = "",
+    subtitle = "log-normalized",
+    caption = "",
+    tag = "",
+    x = "PC1",
+    y = "PC2",
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=8))) +
+  scale_colour_manual(values = my_colors)
+
+  ggsave(
+  paste("./OUTPUT/PCA_INDIVIDUAL_ALPHA - ", "species", "_", "log_normalized", ".png", sep = ""),
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 24,
+  height = 14,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+```
+
+
+```{r}
+#PCA COMPONENT LOADINGS - multiple versions (individual/cancer and prcomp/PCAtools) 
+
+# Define a color gradient from black to green
+colfunc <- colorRampPalette(c("black", "green"))
+
+#INDIVIDUAL PATIENTS (PRCOMP PCA)
+
+# Assume pca_results contains your PCA analysis results
+loadings_df <- as.data.frame(DogHuman.pca_3$rotation[, 1:3])
+
+# Convert to absolute values
+loadings_df <- abs(loadings_df)
+
+# Calculate the top 5% threshold
+threshold_PC1 <- quantile(loadings_df$PC1, 0.95)
+threshold_PC2 <- quantile(loadings_df$PC2, 0.95)
+threshold_PC3 <- quantile(loadings_df$PC3, 0.95)
+
+# Filter rows to include only those above the threshold for at least one PC
+loadings_df <- loadings_df %>% 
+  rownames_to_column("variable") %>% 
+  filter(PC1 > threshold_PC1 | PC2 > threshold_PC2 | PC3 > threshold_PC3)
+
+# Reshape data for plotting
+loadings_melted <- melt(loadings_df, id.vars = "variable")
+names(loadings_melted) <- c("OriginalVariable", "PC", "value")
+
+# Generate the plot
+
+ggplot(loadings_melted, aes(x = PC, y = value, size = value, fill = value)) +
+  geom_point(shape = 21, color = "black") +
+  scale_fill_gradient(low = "black", high = "green", name = "Absolute Value") +
+  geom_text_repel(aes(label = OriginalVariable), color = "black", size = 6, nudge_x = 0.5, nudge_y = 0, segment.size = 0.2) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 22, face = "bold"),
+    axis.text.y = element_text(size = 22, face = "bold"),
+    axis.title.x = element_text(size = 22, face = "bold", margin = margin(t = 30, r = 0, b = 0, l = 0)),
+    axis.title.y = element_text(size = 22, face = "bold", margin = margin(t = 0, r = 30, b = 0, l = 0)),
+    legend.position = "right"
+  ) +
+  labs(x = "Principal Component", y = "Absolute Component Loading", fill = "Absolute Value", size = "Absolute Value") +
+  scale_size_continuous(range = c(1, 20)) +
+  ggtitle("Individuals PRCOMP PCA - Top 5% Absolute Component Loadings")
+
+ggsave(
+  "./OUTPUT/loadings_plot-individuals_prcomp.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 25,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+
+
+#CANCERS ANALYZED EARLIER (PRCOMP PCA)
+
+# Assume pca_results contains your PCA analysis results
+loadings_df <- as.data.frame(pca2$loadings[, 1:3])
+
+# Convert to absolute values
+loadings_df <- abs(loadings_df)
+
+# Calculate the top 5% threshold
+threshold_PC1 <- quantile(loadings_df$PC1, 0.95)
+threshold_PC2 <- quantile(loadings_df$PC2, 0.95)
+threshold_PC3 <- quantile(loadings_df$PC3, 0.95)
+
+# Filter rows to include only those above the threshold for at least one PC
+loadings_df <- loadings_df %>% 
+  rownames_to_column("variable") %>% 
+  filter(PC1 > threshold_PC1 | PC2 > threshold_PC2 | PC3 > threshold_PC3)
+
+# Reshape data for plotting
+loadings_melted <- melt(loadings_df, id.vars = "variable")
+names(loadings_melted) <- c("OriginalVariable", "PC", "value")
+
+# Generate the plot
+
+ggplot(loadings_melted, aes(x = PC, y = value, size = value, fill = value)) +
+  geom_point(shape = 21, color = "black") +
+  scale_fill_gradient(low = "black", high = "green", name = "Absolute Value") +
+  geom_text_repel(aes(label = OriginalVariable), color = "black", size = 6, nudge_x = 0.5, nudge_y = 0, segment.size = 0.2) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 22, face = "bold"),
+    axis.text.y = element_text(size = 22, face = "bold"),
+    axis.title.x = element_text(size = 22, face = "bold", margin = margin(t = 30, r = 0, b = 0, l = 0)),
+    axis.title.y = element_text(size = 22, face = "bold", margin = margin(t = 0, r = 30, b = 0, l = 0)),
+    legend.position = "right"
+  ) +
+  labs(x = "Principal Component", y = "Absolute Component Loading", fill = "Absolute Value", size = "Absolute Value") +
+  scale_size_continuous(range = c(1, 20)) +
+  ggtitle("Cancers PRCOMP PCA - Top 5% Absolute Component Loadings")
+
+ggsave(
+  "./OUTPUT/loadings_plot-cancers_prcomp.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 25,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+#Here I am providing metadata declaration and using it in the plotting code; but this can all be removed without affecting results.
+
+metadata_test <- data.frame(row.names = colnames(t(DogHuman.pca_2)))
+metadata_test$Species <- c(rep("canine", 418), rep("human", 1200))
+metadata_test$Cancers <- gsub('.{8}$', '', rownames(DogHuman.pca_2))
+
+metadata_test2 <- data.frame(row.names = colnames(t(comparing_nonstd_logged)))
+metadata_test2$Species <- c(rep("canine", 14), rep("human", 27))
+metadata_test2$Cancers <- gsub('.{8}$', '', rownames(comparing_nonstd_logged))
+
+
+#INDIVIDUALS (PCAtools PCA for comparison)
+pcatools_ind <- PCAtools::pca(t(DogHuman.pca_2), metadata = metadata_test, center = TRUE, scale = TRUE)
+
+# Assume pca_results contains your PCA analysis results
+loadings_df <- as.data.frame(pcatools_ind$loadings[, 1:3])
+
+# Convert to absolute values
+loadings_df <- abs(loadings_df)
+
+# Calculate the top 5% threshold
+threshold_PC1 <- quantile(loadings_df$PC1, 0.95)
+threshold_PC2 <- quantile(loadings_df$PC2, 0.95)
+threshold_PC3 <- quantile(loadings_df$PC3, 0.95)
+
+# Filter rows to include only those above the threshold for at least one PC
+loadings_df <- loadings_df %>% 
+  rownames_to_column("variable") %>% 
+  filter(PC1 > threshold_PC1 | PC2 > threshold_PC2 | PC3 > threshold_PC3)
+
+# Reshape data for plotting
+loadings_melted <- melt(loadings_df, id.vars = "variable")
+names(loadings_melted) <- c("OriginalVariable", "PC", "value")
+
+# Generate the plot
+
+ggplot(loadings_melted, aes(x = PC, y = value, size = value, fill = value)) +
+  geom_point(shape = 21, color = "black") +
+  scale_fill_gradient(low = "black", high = "green", name = "Absolute Value") +
+  geom_text_repel(aes(label = OriginalVariable), color = "black", size = 6, nudge_x = 0.5, nudge_y = 0, segment.size = 0.2) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 22, face = "bold"),
+    axis.text.y = element_text(size = 22, face = "bold"),
+    axis.title.x = element_text(size = 22, face = "bold", margin = margin(t = 30, r = 0, b = 0, l = 0)),
+    axis.title.y = element_text(size = 22, face = "bold", margin = margin(t = 0, r = 30, b = 0, l = 0)),
+    legend.position = "right"
+  ) +
+  labs(x = "Principal Component", y = "Absolute Component Loading", fill = "Absolute Value", size = "Absolute Value") +
+  scale_size_continuous(range = c(1, 20)) +
+  ggtitle("Individuals PCAtools PCA - Top 5% Absolute Component Loadings")
+
+
+
+ggsave(
+  "./OUTPUT/loadings_plot-individuals_PCAtools.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 25,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+#EXTRA - the PCAtools plotting way
+
+plotloadings(pcatools_ind,
+    components = getComponents(pcatools_ind, c(1:3)),
+    rangeRetain = 0.05,
+    absolute = TRUE,
+    labSize = 4.0,
+    title = 'PCAtools_plotter_ind',
+    ylab = "Absolute component loading",
+    axisLabSize = 16,
+    subtitle = 'PC 1-3',
+    caption = 'Top 5% variables',
+    shape = 21, 
+    shapeSizeRange = c(1, 16),
+    col = c("black", colour1),
+    drawConnectors = TRUE) + theme(aspect.ratio = 1)
+
+
+ggsave(
+  "./OUTPUT/PCAtools_plotter_ind.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+
+
+#CANCERS (PCAtools PCA for comparison)
+
+pcatools_can <- PCAtools::pca(t(comparing_nonstd_logged), metadata = metadata_test2, center = TRUE, scale = TRUE)
+
+# Assume pca_results contains your PCA analysis results
+loadings_df <- as.data.frame(pcatools_can$loadings[, 1:3])
+
+# Convert to absolute values
+loadings_df <- abs(loadings_df)
+
+# Calculate the top 5% threshold
+threshold_PC1 <- quantile(loadings_df$PC1, 0.95)
+threshold_PC2 <- quantile(loadings_df$PC2, 0.95)
+threshold_PC3 <- quantile(loadings_df$PC3, 0.95)
+
+# Filter rows to include only those above the threshold for at least one PC
+loadings_df <- loadings_df %>% 
+  rownames_to_column("variable") %>% 
+  filter(PC1 > threshold_PC1 | PC2 > threshold_PC2 | PC3 > threshold_PC3)
+
+# Reshape data for plotting
+loadings_melted <- melt(loadings_df, id.vars = "variable")
+names(loadings_melted) <- c("OriginalVariable", "PC", "value")
+
+# Generate the plot
+
+ggplot(loadings_melted, aes(x = PC, y = value, size = value, fill = value)) +
+  geom_point(shape = 21, color = "black") +
+  scale_fill_gradient(low = "black", high = "green", name = "Absolute Value") +
+  geom_text_repel(aes(label = OriginalVariable), color = "black", size = 6, nudge_x = 0.5, nudge_y = 0, segment.size = 0.2) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 22, face = "bold"),
+    axis.text.y = element_text(size = 22, face = "bold"),
+    axis.title.x = element_text(size = 22, face = "bold", margin = margin(t = 30, r = 0, b = 0, l = 0)),
+    axis.title.y = element_text(size = 22, face = "bold", margin = margin(t = 0, r = 30, b = 0, l = 0)),
+    legend.position = "right"
+  ) +
+  labs(x = "Principal Component", y = "Absolute Component Loading", fill = "Absolute Value", size = "Absolute Value") +
+  scale_size_continuous(range = c(1, 20)) +
+  ggtitle("Cancers PCAtools PCA - Top 5% Absolute Component Loadings")
+
+ggsave(
+  "./OUTPUT/loadings_plot-cancers_PCAtools.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 25,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+
+#EXTRA - the PCAtools plotting way
+
+plotloadings(pcatools_can,
+    components = getComponents(pcatools_can, c(1:3)),
+    rangeRetain = 0.05,
+    absolute = TRUE,
+    labSize = 4.0,
+    title = 'PCAtools_plotter_can',
+    ylab = "Absolute component loading",
+    axisLabSize = 16,
+    subtitle = 'PC 1-3',
+    caption = 'Top 5% variables',
+    shape = 21, 
+    shapeSizeRange = c(1, 16),
+    col = c("black", colour1),
+    drawConnectors = TRUE) + theme(aspect.ratio = 1)
+
+
+ggsave(
+  "./OUTPUT/PCAtools_plotter_can.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+
+# Assume pca_results contains your PCA analysis results
+loadings_df <- as.data.frame(pcatools_can$loadings[, 1:3])
+
+# Calculate the 5% and 95% quantiles for each PC
+quantiles_PC1 <- quantile(loadings_df$PC1, c(0.05, 0.95))
+quantiles_PC2 <- quantile(loadings_df$PC2, c(0.05, 0.95))
+quantiles_PC3 <- quantile(loadings_df$PC3, c(0.05, 0.95))
+
+# Filter rows to include only those that are outside of the 5%-95% range for at least one PC
+loadings_df <- loadings_df %>% 
+  rownames_to_column("variable") %>% 
+  filter(
+    PC1 < quantiles_PC1[1] | PC1 > quantiles_PC1[2] |
+    PC2 < quantiles_PC2[1] | PC2 > quantiles_PC2[2] |
+    PC3 < quantiles_PC3[1] | PC3 > quantiles_PC3[2]
+  )
+
+# Convert the selected data to absolute values
+loadings_df[, c("PC1", "PC2", "PC3")] <- abs(loadings_df[, c("PC1", "PC2", "PC3")])
+
+# Reshape data for plotting
+loadings_melted <- melt(loadings_df, id.vars = "variable")
+names(loadings_melted) <- c("OriginalVariable", "PC", "value")
+
+# Generate the plot
+ggplot(loadings_melted, aes(x = PC, y = value, size = value, fill = value)) +
+  geom_point(shape = 21, color = "black") +
+  scale_fill_gradient(low = "black", high = "green", name = "Absolute Value") +
+  geom_text_repel(aes(label = OriginalVariable), color = "black", size = 6, nudge_x = 0.5, nudge_y = 0, segment.size = 0.2) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 22, face = "bold"),
+    axis.text.y = element_text(size = 22, face = "bold"),
+    axis.title.x = element_text(size = 22, face = "bold", margin = margin(t = 30, r = 0, b = 0, l = 0)),
+    axis.title.y = element_text(size = 22, face = "bold", margin = margin(t = 0, r = 30, b = 0, l = 0)),
+    legend.position = "right"
+  ) +
+  labs(x = "Principal Component", y = "Absolute Component Loading", fill = "Absolute Value", size = "Absolute Value") +
+  scale_size_continuous(range = c(1, 20)) +
+  ggtitle("Cancers PCAtools PCA - Top 5% Extreme Component Loadings, PCAtools-like selection")
+
+ggsave(
+  "./OUTPUT/PCAtools_butIplot_butSelectionTheirWay_Cancers.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 20,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+```
+
+
+```{r}
+#PCA FUNCTION FOR individual and paired plots of individual patients signatures 
+#based on the earlier UMAP function and input data
+
+#PLOT OF 1-2 CANCERs IN INDIVIDUALS, with alpha higher for the chosen group
+
+pca_df <- as.data.frame(DogHuman.pca_3$x[,c(1,2)])
+
+gg_function_PCA_alpha <- function(cancer1, cancer2, col1, col2, label1, label2, pointsalpha) {
+
+#Preparing a small df with only the rows for cancer of interest
+
+PCA_choice1 <- cbind(pca_df, DogHuman.labels)
+PCA_choice1 <- PCA_choice1[PCA_choice1[,3] == cancer1,]
+
+PCA_choice2 <- cbind(pca_df, DogHuman.labels)
+PCA_choice2 <- PCA_choice2[PCA_choice2[,3] == cancer2,]
+
+#GGplot with a separate geom for the chosen points
+
+  ggplot(pca_df, aes(x = pca_df[,1], y = pca_df[,2])) + 
+  geom_point(size = 1, alpha = 0.2, color = "grey") + 
+  geom_point(data = PCA_choice1, size = 1, alpha = pointsalpha, aes(x = PCA_choice1[,1], y = PCA_choice1[,2], color = cancer1)) +
+  geom_point(data = PCA_choice2, size = 1, alpha = pointsalpha, aes(x = PCA_choice2[,1], y = PCA_choice2[,2], color = cancer2)) +
+  theme_classic() + 
+  theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=16)) + 
+  labs(
+    title = "",
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = label1,
+    y = label2,
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=8))) +
+  scale_colour_manual(values = setNames(c(col1, col2), c(cancer1, cancer2)))
+  
+  ggsave(
+  paste("./OUTPUT/PCA_INDIVIDUAL_ALPHA - ", cancer1, "_", cancer2, ".png", sep = ""),
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 24,
+  height = 14,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+  )
+  
+}
+
+#Code to generate plots for chosen pairs
+
+#Colours
+colour1 <- "chartreuse3"
+colour2 <- "dodgerblue4"
+
+gg_function_PCA_alpha("glioma (canine)", "glioma (human)", colour1, colour2, "PC1", "PC2", 0.6)
+
+
+gg_function_PCA_alpha("osteosarcoma (canine)", "sarcoma (human)", "black", "red", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha("prostate carcinoma (canine)", "prostate adenocarcinoma (human)", "black",  "red", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha("NULL", "cholangiocarcinoma (human)", "NULL", "red", "PC1", "PC2", 0.6)
+
+
+#Code to generate a single plot for each cancer type
+
+for (n in unique(DogHuman.labels)) {gg_function_PCA_alpha(n, "NULL", "red", "NULL", "PC1", "PC2", 0.5)}
+```
+
+
+```{r}
+#PCA - BRAIN CANCERS CUSTOM MULTIPLOT 
+
+#It is based on the earlier umap code, BUT I am adding the "input" as a parameter to the function, so I can generate variants of the figure with various data normalizations.
+
+#FYI, this is the default input, defined earlier:
+#pca_df <- as.data.frame(DogHuman.pca_3$x[,c(1,2)])
+
+#I am creating these renamed DFs to use it for differentiating the output file versions.
+
+pca_df_transpose_scaled <- as.data.frame(DogHuman.pca$x[,c(1,2)])
+pca_df_log_normalized <- as.data.frame(DogHuman.pca_3$x[,c(1,2)])
+
+gg_function_PCA_alpha_BRAINS <- function(input_df, filename, cancer1, cancer2, cancer3, cancer4, col1, col2, col3, col4, label1, label2, pointsalpha) {
+
+#Preparing a small df with only the rows for cancer of interest
+
+PCA_choice1 <- cbind(input_df, DogHuman.labels)
+PCA_choice1 <- PCA_choice1[PCA_choice1[,3] == cancer1,]
+
+PCA_choice2 <- cbind(input_df, DogHuman.labels)
+PCA_choice2 <- PCA_choice2[PCA_choice2[,3] == cancer2,]
+
+PCA_choice3 <- cbind(input_df, DogHuman.labels)
+PCA_choice3 <- PCA_choice3[PCA_choice3[,3] == cancer3,]
+
+PCA_choice4 <- cbind(input_df, DogHuman.labels)
+PCA_choice4 <- PCA_choice4[PCA_choice4[,3] == cancer4,]
+
+#GGplot with a separate geom for the chosen points
+
+  ggplot(input_df, aes(x = input_df[,1], y = input_df[,2])) + 
+  geom_point(size = 1, alpha = 0.2, color = "grey") + 
+  geom_point(data = PCA_choice1, size = 1, alpha = pointsalpha, aes(x = PCA_choice1[,1], y = PCA_choice1[,2], color = cancer1)) +
+  geom_point(data = PCA_choice2, size = 1, alpha = pointsalpha, aes(x = PCA_choice2[,1], y = PCA_choice2[,2], color = cancer2)) +
+  geom_point(data = PCA_choice3, size = 1, alpha = pointsalpha, aes(x = PCA_choice3[,1], y = PCA_choice3[,2], color = cancer3)) +
+  geom_point(data = PCA_choice4, size = 1, alpha = pointsalpha, aes(x = PCA_choice4[,1], y = PCA_choice4[,2], color = cancer4)) +
+  theme_classic() + 
+  theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=10)) + 
+  labs(
+    title = "",
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = label1,
+    y = label2,
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=8))) +
+  scale_colour_manual(values = setNames(c(col1, col2, col3, col4), c(cancer1, cancer2, cancer3, cancer4)), breaks=c(cancer1, cancer2, cancer3, cancer4))
+
+#The breaks argument above in scale_colour_manual allows me to put the cancers on the legend in the defined order, otherwise they are 
+#sorted alphabetically by R, which in this case is confusing when trying to interpret the plot.
+  
+  ggsave(
+  paste("./OUTPUT/PCA_INDIVIDUAL_BRAINS - ", filename, ".png", sep = ""),
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 24,
+  height = 14,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+  )
+  
+}
+
+
+#colours for brain cancers, from Viridis palette, manually chosen
+
+colour4 <- "#440154"
+colour3 <- "#3b528b"
+colour2 <- "#21918c"
+colour1 <- "#5ec962"
+
+gg_function_PCA_alpha_BRAINS(pca_df_transpose_scaled, "transpose-scaled", "glioma (canine)", "meningioma (canine)", "glioma (human)", "glioblastoma multiforme (human)", colour1, colour2, colour3, colour4, "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_BRAINS(pca_df_log_normalized, "log-normalized", "glioma (canine)", "meningioma (canine)", "glioma (human)", "glioblastoma multiforme (human)", colour1, colour2, colour3, colour4, "PC1", "PC2", 0.6)
+```
+
+```{r}
+#PCA - SARCOMAS CUSTOM MULTIPLOT
+
+pca_df_transpose_scaled <- as.data.frame(DogHuman.pca$x[,c(1,2)])
+pca_df_log_normalized <- as.data.frame(DogHuman.pca_3$x[,c(1,2)])
+
+
+gg_function_PCA_alpha_SARCOMAS <- function(input_df, filename, cancer1, cancer2, cancer3, col1, col2, col3, label1, label2, pointsalpha) {
+
+#Preparing a small df with only the rows for cancer of interest
+
+PCA_choice1 <- cbind(input_df, DogHuman.labels)
+PCA_choice1 <- PCA_choice1[PCA_choice1[,3] == cancer1,]
+
+PCA_choice2 <- cbind(input_df, DogHuman.labels)
+PCA_choice2 <- PCA_choice2[PCA_choice2[,3] == cancer2,]
+
+PCA_choice3 <- cbind(input_df, DogHuman.labels)
+PCA_choice3 <- PCA_choice3[PCA_choice3[,3] == cancer3,]
+
+#GGplot with a separate geom for the chosen points
+
+  ggplot(input_df, aes(x = input_df[,1], y = input_df[,2])) + 
+  geom_point(size = 1, alpha = 0.2, color = "grey") + 
+  geom_point(data = PCA_choice1, size = 1, alpha = pointsalpha, aes(x = PCA_choice1[,1], y = PCA_choice1[,2], color = cancer1)) +
+  geom_point(data = PCA_choice2, size = 1, alpha = pointsalpha, aes(x = PCA_choice2[,1], y = PCA_choice2[,2], color = cancer2)) +
+  geom_point(data = PCA_choice3, size = 1, alpha = pointsalpha, aes(x = PCA_choice3[,1], y = PCA_choice3[,2], color = cancer3)) +
+  theme_classic() + 
+  theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=10)) + 
+  labs(
+    title = "",
+    subtitle = "",
+    caption = "",
+    tag = "",
+    x = label1,
+    y = label2,
+  ) +
+  theme(aspect.ratio = 0.5) +
+  guides(color = guide_legend(override.aes = list(size=8))) +
+  scale_colour_manual(values = setNames(c(col1, col2, col3), c(cancer1, cancer2, cancer3)), breaks=c(cancer2, cancer1, cancer3))
+
+#The breaks argument above in scale_colour_manual allows me to put the cancers on the legend in the defined order, otherwise they are 
+#sorted alphabetically by R, which in this case is confusing when trying to interpret the plot.
+  
+  ggsave(
+  paste("./OUTPUT/PCA_INDIVIDUAL_SARCOMAS - ", filename, ".png", sep = ""),
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 24,
+  height = 14,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+  )
+  
+}
+
+
+#colours for brain cancers, from Viridis palette, manually chosen
+
+colour4 <- "#440154"
+colour3 <- "#3b528b"
+colour2 <- "#21918c"
+colour1 <- "#5ec962"
+
+
+gg_function_PCA_alpha_SARCOMAS(pca_df_transpose_scaled, "transpose-scaled", "osteosarcoma (canine)", "hemangiosarcoma (canine)", "sarcoma (human)", colour1, colour2, colour4, "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_SARCOMAS(pca_df_log_normalized, "log-normalized", "osteosarcoma (canine)", "hemangiosarcoma (canine)", "sarcoma (human)", colour1, colour2, colour4, "PC1", "PC2", 0.6)
+```
+
+
+```{r}
+#Preparing a variant of my two functions for the use in the next two chunks, to add custom labels to my data on plots
+
+###PCA
+
+gg_function_PCA_alpha_MOD <- function(cancer1, cancer2, datalabel1, datalabel2, col1, col2, label1, label2, pointsalpha) {
+
+  #Preparing a small df with only the rows for cancer of interest
+  PCA_choice1 <- cbind(pca_df, DogHuman.labels)
+  PCA_choice1 <- PCA_choice1[PCA_choice1[,3] == cancer1,]
+
+  PCA_choice2 <- cbind(pca_df, DogHuman.labels)
+  PCA_choice2 <- PCA_choice2[PCA_choice2[,3] == cancer2,]
+
+  #GGplot with a separate geom for the chosen points
+  ggplot(pca_df, aes(x = pca_df[,1], y = pca_df[,2])) + 
+    geom_point(size = 1, alpha = 0.2, color = "grey") + 
+    geom_point(data = PCA_choice1, size = 1, alpha = pointsalpha, aes(x = PCA_choice1[,1], y = PCA_choice1[,2], color = datalabel1)) +
+    geom_point(data = PCA_choice2, size = 1, alpha = pointsalpha, aes(x = PCA_choice2[,1], y = PCA_choice2[,2], color = datalabel2)) +
+    theme_classic() + 
+    theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=16)) + 
+    labs(
+      title = "",
+      subtitle = "",
+      caption = "",
+      tag = "",
+      x = label1,
+      y = label2,
+    ) +
+    theme(aspect.ratio = 0.5) +
+    guides(color = guide_legend(override.aes = list(size=8))) +
+    scale_colour_manual(values = setNames(c(col1, col2), c(datalabel1, datalabel2)))
+  
+  ggsave(
+    paste("./OUTPUT/PCA_INDIVIDUAL_ALPHA - ", cancer1, "_", cancer2, ".png", sep = ""),
+    plot = last_plot(),
+    device = "png",
+    path = "./",
+    scale = 1,
+    width = 24,
+    height = 14,
+    units = "cm",
+    dpi = "print",
+    limitsize = TRUE,
+    bg = "white",
+  )
+}
+
+#EXAMPLE
+#gg_function_PCA_alpha("Breast", "Lung", "Breast Cancer Label", "Lung Cancer Label", "blue", "red", "X-axis Label", "Y-axis Label", 0.5)
+
+
+###UMAP
+
+gg_function_UMAP_alpha_MOD <- function(cancer1, cancer2, datalabel1, datalabel2, col1, col2, label1, label2, pointsalpha) {
+
+  #Preparing a small df with only the rows for cancer of interest
+  UMAP_choice1 <- cbind(umap_df, DogHuman.labels)
+  UMAP_choice1 <- UMAP_choice1[UMAP_choice1[,3] == cancer1,]
+
+  UMAP_choice2 <- cbind(umap_df, DogHuman.labels)
+  UMAP_choice2 <- UMAP_choice2[UMAP_choice2[,3] == cancer2,]
+
+  #GGplot with a separate geom for the chosen points
+  ggplot(umap_df, aes(x = umap_df[,1], y = umap_df[,2])) + 
+    geom_point(size = 1, alpha = 0.2, color = "grey") + 
+    geom_point(data = UMAP_choice1, size = 1, alpha = pointsalpha, aes(x = UMAP_choice1[,1], y = UMAP_choice1[,2], color = datalabel1)) +
+    geom_point(data = UMAP_choice2, size = 1, alpha = pointsalpha, aes(x = UMAP_choice2[,1], y = UMAP_choice2[,2], color = datalabel2)) +
+    theme_classic() + 
+    theme(legend.position = "top", legend.title = element_blank(), legend.text = element_text(size=16)) + 
+    labs(
+      title = "",
+      subtitle = "",
+      caption = "",
+      tag = "",
+      x = label1,
+      y = label2,
+    ) +
+    theme(aspect.ratio = 0.5) +
+    guides(color = guide_legend(override.aes = list(size=8))) +
+    scale_colour_manual(values = setNames(c(col1, col2), c(datalabel1, datalabel2)))
+  
+  ggsave(
+    paste("./OUTPUT/UMAP_INDIVIDUAL_ALPHA - ", cancer1, "_", cancer2, ".png", sep = ""),
+    plot = last_plot(),
+    device = "png",
+    path = "./",
+    scale = 1,
+    width = 24,
+    height = 14,
+    units = "cm",
+    dpi = "print",
+    limitsize = TRUE,
+    bg = "white",
+  )
+}
+```
+
+```{r}
+# Healthy vs cancer tissues in human data from EBI.
+
+#Importing a complete file from EBI, the only preprocessing in Excel was removing a few first rows and saving as CSV.
+#check.names=FALSE lets it import the column names as they are originally, without the spaces and dashes are converted to dots
+
+TPM_Human_ALL <- read.csv(file = "./INPUT/EBI_individuals_all.csv", sep = ";", check.names=FALSE)
+
+#colnames(TPM_Human)[-c(1,2)] <- paste(colnames(TPM_Human)[-c(1,2)],"(human)",sep=" ")
+
+#Correcting an ugly random name of the first column
+#colnames(TPM_Human)[1] <- "IC"
+
+#Keeping the rows of interest - copied
+
+selected <- c("ENSG00000188389", "ENSG00000120217", "ENSG00000197646", "ENSG00000135077", "ENSG00000168961", "ENSG00000089692", "ENSG00000104760", "ENSG00000163599", "ENSG00000178562", "ENSG00000121594", "ENSG00000114013", "ENSG00000181847", "ENSG00000143217", "ENSG00000073008", "ENSG00000198053", "ENSG00000196776", "ENSG00000213413", "ENSG00000107738", "ENSG00000134258", "ENSG00000128271", "ENSG00000165168", "ENSG00000163600", "ENSG00000160223", "ENSG00000186827", "ENSG00000117586", "ENSG00000049249", "ENSG00000125657", "ENSG00000101017", "ENSG00000102245", "ENSG00000139193", "ENSG00000125726", "ENSG00000150637", "ENSG00000186891", "ENSG00000120337", "ENSG00000157873", "ENSG00000125735", "ENSG00000117281", "ENSG00000186265", "ENSG00000134545", "ENSG00000103855", "ENSG00000153283", "ENSG00000026751", "ENSG00000118520", "ENSG00000131203")
+
+names3 <- c("PD-1", "PD-L1", "PD-L2", "TIM-3", "GAL-9", "LAG-3", "FGL-1", "CTLA-4", "CD28", "CD80", "CD86", "TIGIT", "NECTIN4", "CD155", "SIRPA", "CD47", "PVRIG", "VISTA", "B7-H4", "A2AR", "NOX2", "ICOS", "ICOSLG", "OX40", "OX40L", "4-1BB", "4-1BBL", "CD40", "CD40L", "CD27", "CD70", "CD226", "GITR", "GITRL", "HVEM", "LIGHT", "CD160", "BTLA", "NKG2A", "B7-H3", "TACTILE", "SLAMF7", "Arginase 1", "IDO")
+
+#keep the rows with genes of interest
+
+rownames(TPM_Human_ALL) <- TPM_Human_ALL[,1]
+
+TPM_Human_ALL2 <- TPM_Human_ALL[selected3,]
+
+#Add my gene names before I remove their names so I can still check alignment
+
+rownames(TPM_Human_ALL2) <- names3
+
+#Replace NAs with 0
+
+TPM_Human_ALL2[is.na(TPM_Human_ALL2)] <- 0
+
+TPM_Human_ALL3 <- TPM_Human_ALL2[,-c(1:2)]
+
+#Prep
+
+DogHuman.data <- t(scale(TPM_Human_ALL3))
+
+DogHuman.labels <- colnames(TPM_Human_ALL3)
+
+#Function to create concise form labels, keeping the cancer name (until comma) and the last word (tumour or normal)
+
+create_concise_label <- function(label) 
+  {
+  namestart <- gsub("\\,.*", "", label)
+  nameend <- stringi::stri_extract_last_words(label)
+  return(paste(namestart, nameend, sep = "-"))
+}
+
+#Apply function to all labels, not creating a new vector, because the function later needs "DogHumans.labels"
+
+DogHuman.labels <- sapply(DogHuman.labels, create_concise_label)
+
+#So that it is not a vector with names for elements
+
+DogHuman.labels <- as.vector(DogHuman.labels)
+
+#UMAP
+
+DogHuman.umap <- umap(DogHuman.data)
+
+#plot(DogHuman.umap$layout) 
+
+#Preparing data for function
+
+umap_df <- as.data.frame(DogHuman.umap$layout)
+
+#using the MOD function to plot dataset pairs; it takes umap_df as an input
+
+gg_function_UMAP_alpha_MOD("cholangiocarcinoma-tumour", "cholangiocarcinoma-normal", "cholangiocarcinoma", "healthy liver", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("chromophobe renal cell carcinoma-tumour", "chromophobe renal cell carcinoma-normal", "chromophobe renal cell carcinoma", "healthy kidney", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("lung adenocarcinoma-tumour", "lung adenocarcinoma-normal", "lung adenocarcinoma", "healthy lung", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("squamous cell lung carcinoma-tumour", "squamous cell lung carcinoma-normal", "squamous cell lung carcinoma", "healthy lung", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("hepatocellular carcinoma-tumour", "hepatocellular carcinoma-normal", "hepatocellular carcinoma", "healthy liver", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("renal cell carcinoma-tumour", "renal cell carcinoma-normal", "renal cell carcinoma", "healthy kidney", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+#The ones with less than 9 normals, but let's take a look anyway
+
+gg_function_UMAP_alpha_MOD("breast adenocarcinoma-tumour", "breast adenocarcinoma-normal", "breast adenocarcinoma", "healthy breast", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("bladder transitional cell carcinoma-tumour", "bladder transitional cell carcinoma-normal", "bladder transitional cell carcinoma", "healthy bladder", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("follicular thyroid carcinoma-tumour", "follicular thyroid carcinoma-normal", "follicular thyroid carcinoma", "healthy thyroid", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("gastric adenocarcinoma-tumour", "gastric adenocarcinoma-normal", "gastric adenocarcinoma", "healthy stomach", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("endometrial adenocarcinoma-tumour", "endometrial adenocarcinoma-normal", "endometrial adenocarcinoma", "healthy uterus", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("prostate adenocarcinoma-tumour", "prostate adenocarcinoma-normal", "prostate adenocarcinoma", "healthy prostate", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+
+gg_function_UMAP_alpha_MOD("head and neck squamous cell carcinoma-tumour", "head and neck squamous cell carcinoma-normal", "head and neck squamous cell carcinoma-tumour", "healthy mouth mucosa", "red", "black", "UMAP-1", "UMAP-2", 0.6)
+```
+
+
+```{r}
+#Now I just want to supplement this with PCA of the same stuff
+
+#I customize dataset here - I do not want it scaled centered before PCA, because a) then logging introduces NaNs (because of values below 0), and b) prcomp will be doing the same in a moment.
+
+DogHuman.data <- t(TPM_Human_ALL3)
+
+DogHuman.pca_canc_norm <- log2(DogHuman.data + 1)
+DogHuman.pca_canc_norm <- prcomp(DogHuman.pca_canc_norm, center = TRUE, scale = TRUE)
+
+pca_df <- as.data.frame(DogHuman.pca_canc_norm$x[,c(1,2)])
+
+
+#using the MOD function to plot dataset pairs; it takes pca_df as an input
+
+gg_function_PCA_alpha_MOD("cholangiocarcinoma-tumour", "cholangiocarcinoma-normal", "cholangiocarcinoma", "healthy liver", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("chromophobe renal cell carcinoma-tumour", "chromophobe renal cell carcinoma-normal", "chromophobe renal cell carcinoma", "healthy kidney", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("lung adenocarcinoma-tumour", "lung adenocarcinoma-normal", "lung adenocarcinoma", "healthy lung", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("squamous cell lung carcinoma-tumour", "squamous cell lung carcinoma-normal", "squamous cell lung carcinoma", "healthy lung", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("hepatocellular carcinoma-tumour", "hepatocellular carcinoma-normal", "hepatocellular carcinoma", "healthy liver", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("renal cell carcinoma-tumour", "renal cell carcinoma-normal", "renal cell carcinoma", "healthy kidney", "red", "black", "PC1", "PC2", 0.6)
+
+#The ones with less than 9 normals, but let's take a look anyway...
+
+gg_function_PCA_alpha_MOD("breast adenocarcinoma-tumour", "breast adenocarcinoma-normal", "breast adenocarcinoma", "healthy breast", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("bladder transitional cell carcinoma-tumour", "bladder transitional cell carcinoma-normal", "bladder transitional cell carcinoma", "healthy bladder", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("follicular thyroid carcinoma-tumour", "follicular thyroid carcinoma-normal", "follicular thyroid carcinoma", "healthy thyroid", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("gastric adenocarcinoma-tumour", "gastric adenocarcinoma-normal", "gastric adenocarcinoma", "healthy stomach", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("endometrial adenocarcinoma-tumour", "endometrial adenocarcinoma-normal", "endometrial adenocarcinoma", "healthy uterus", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("prostate adenocarcinoma-tumour", "prostate adenocarcinoma-normal", "prostate adenocarcinoma", "healthy prostate", "red", "black", "PC1", "PC2", 0.6)
+
+gg_function_PCA_alpha_MOD("head and neck squamous cell carcinoma-tumour", "head and neck squamous cell carcinoma-normal", "head and neck squamous cell carcinoma-tumour", "healthy mouth mucosa", "red", "black", "PC1", "PC2", 0.6)
+```
+
+
+```{r}
+###Exploring PC1 in the context of RCC mainly - as the Renal Cell Carcinoma  seems to have a major shift as compared to its reference healthy samples and this shift seems to be along PC-1, so I am reporting in the paper which genes may be involved based on the component loadings.
+
+abs(DogHuman.pca_canc_norm$rotation[,1:3])
+
+# Assume pca_results contains your PCA analysis results
+loadings_df <- as.data.frame(DogHuman.pca_canc_norm$rotation[, 1:3])
+
+# Convert to absolute values
+loadings_df <- abs(loadings_df)
+
+# Calculate the top 5% threshold
+threshold_PC1 <- quantile(loadings_df$PC1, 0.95)
+threshold_PC2 <- quantile(loadings_df$PC2, 0.95)
+threshold_PC3 <- quantile(loadings_df$PC3, 0.95)
+
+# Filter rows to include only those above the threshold for at least one PC
+loadings_df <- loadings_df %>% 
+  rownames_to_column("variable") %>% 
+  filter(PC1 > threshold_PC1 | PC2 > threshold_PC2 | PC3 > threshold_PC3)
+
+library(reshape2)
+
+# Reshape data for plotting
+loadings_melted <- melt(loadings_df, id.vars = "variable")
+names(loadings_melted) <- c("OriginalVariable", "PC", "value")
+
+
+# Generate the plot
+
+ggplot(loadings_melted, aes(x = PC, y = value, size = value, fill = value)) +
+  geom_point(shape = 21, color = "black") +
+  scale_fill_gradient(low = "black", high = "green", name = "Absolute Value") +
+  geom_text_repel(aes(label = OriginalVariable), color = "black", size = 6, nudge_x = 0.5, nudge_y = 0, segment.size = 0.2) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 22, face = "bold"),
+    axis.text.y = element_text(size = 22, face = "bold"),
+    axis.title.x = element_text(size = 22, face = "bold", margin = margin(t = 30, r = 0, b = 0, l = 0)),
+    axis.title.y = element_text(size = 22, face = "bold", margin = margin(t = 0, r = 30, b = 0, l = 0)),
+    legend.position = "right"
+  ) +
+  labs(x = "Principal Component", y = "Absolute Component Loading", fill = "Absolute Value", size = "Absolute Value") +
+  scale_size_continuous(range = c(1, 20)) +
+  ggtitle("Individuals PRCOMP PCA - Top 5% Absolute Component Loadings")
+
+
+ggsave(
+  "./OUTPUT/loadings_cancnorm_PC1_RCC.png",
+  plot = last_plot(),
+  device = "png",
+  path = "./",
+  scale = 1,
+  width = 25,
+  height = 20,
+  units = "cm",
+  dpi = "print",
+  limitsize = TRUE,
+  bg = "white",
+)
+```
+
+```{r}
+#Exporting version information for directly loaded packages and their dependencies. 
+
+# Function to get all dependencies
+get_all_dependencies <- function(pkg) {
+  deps <- unclass(tools::package_dependencies(pkg, recursive=TRUE))
+  return(deps[[1]])
+}
+
+# Use the function for your packages
+my_packages <- c("ggplot2", "dplyr", "tidyverse")
+
+# Get dependencies
+all_deps <- unlist(lapply(my_packages, get_all_dependencies))
+
+# Remove duplicates - reducing redundant operations
+unique_deps <- unique(all_deps)
+
+# Get versions for all packages (your packages + dependencies)
+all_pkgs <- c(my_packages, unique_deps)
+
+# Initialize a data frame to store package versions
+pkg_versions <- data.frame(package=character(), version=character())
+
+
+# Loop over all packages and get versions; 
+for (pkg in all_pkgs) {
+  version <- ifelse(requireNamespace(pkg, quietly = TRUE),
+    tryCatch({
+      as.character(packageVersion(pkg))
+    }, error=function(e) NA), # Packages with "NA" version = corrupt or not installed - likely "suggests" class dependency
+    "Not installed"
+  )
+  
+  pkg_versions <- rbind(pkg_versions, data.frame(package=pkg, version=version))
+}
+
+
+# Remove duplicates based on both package and version
+pkg_versions <- pkg_versions[!duplicated(pkg_versions), ]
+
+# Write the data frame to a CSV file
+write.csv(pkg_versions, file="./OUTPUT/20230624_Package_Versions.csv", row.names=FALSE)
+```
+

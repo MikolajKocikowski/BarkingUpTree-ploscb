@@ -1,0 +1,32 @@
+# Ignore all contents of INPUT and OUTPUT folders
+INPUT/*
+OUTPUT/*
+
+# Allow empty folders to stay tracked
+!INPUT/.keep
+!OUTPUT/.keep
+
+# Ignore large result files
+*.RData
+*.rds
+*.csv
+*.tsv
+*.h5
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.svg
+
+# Ignore checkpoints, history, RStudio state
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Ignore backup and temp files
+*~
+*.swp
+*.tmp
+*.bak
+
