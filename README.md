@@ -32,3 +32,14 @@ The DESeq2-processed dataset (`BarkingUpTree_DDS_processed.RData`), which serves
 ## Reproducibility Notes
 
 This analysis was originally developed under Windows 10 (R 4.2.3) using RStudio 2022.07.0. However, the current version of the code was rerun on Linux Mint 22.1 (R 4.3.3) with RStudio 2025.05.0 and the current release of all packages.
+
+## Citation
+
+If you use this repository in your work, please cite the associated preprint:
+
+Kocikowski M, Yébenes Mayordomo M, Alfaro J, Parys M.  
+*Barking Up the Right Tree: Immune Checkpoint Signatures of Human and Dog Cancers.*  
+bioRxiv. https://doi.org/10.1101/2024.06.26.600825
+
+A citation file is included (CITATION.cff) for use with GitHub and reference managers.
+
