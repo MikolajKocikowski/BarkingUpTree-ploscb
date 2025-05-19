@@ -24,7 +24,7 @@ Clone the repository, obtain the data as described in the next section, open `Ba
 
 ## Data
 
-All required input files - including the GTF annotation, raw quantification files from Kallisto, filtered expression matrices from EBI, and marker gene lists - are deposited on Zenodo: [DOI link]. To run the R script, copy these files into the `INPUT/` directory.
+All required input files - including the GTF annotation, raw quantification files from Kallisto, filtered expression matrices from EBI, and marker gene lists - are deposited on Zenodo: [10.5281/zenodo.15463426](https://doi.org/10.5281/zenodo.15463426). To run the R script, copy these files into the `INPUT/` directory.
 
 The DESeq2-processed dataset (`BarkingUpTree_DDS_processed.RData`), which serves as the source for all downstream tables and figures, is also available on Zenodo. It can be loaded directly into R.
 
